@@ -10,6 +10,38 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <limits>
+#include <algorithm>
+#include <sstream>
+#include <map>
+
+// ==========================================
+// Visual Styles & Colors
+// ==========================================
+const std::string RESET   = "\033[0m";
+const std::string RED     = "\033[31m";
+const std::string GREEN   = "\033[32m";
+const std::string YELLOW  = "\033[33m";
+const std::string BLUE    = "\033[34m";
+const std::string MAGENTA = "\033[35m";
+const std::string CYAN    = "\033[36m";
+const std::string BOLD    = "\033[1m";
+
+void clearScreen() {
+    std::cout << "\033[2J\033[1;1H";
+}
+
+void printBanner() {
+    clearScreen();
+    std::cout << CYAN << BOLD
+              << "╔════════════════════════════════════════════════════╗\n"
+              << "║              EXTERNAL PATCHER (LINUX)              ║\n"
+              << "║        " << RESET << "Camera Distance & Weather Changer" << CYAN << BOLD << "         ║\n"
+              << "╚════════════════════════════════════════════════════╝" << RESET << "\n\n";
+}
+
+// ==========================================
+// Memory Classes
+// ==========================================
 
 struct MemoryRegion {
     uintptr_t start;
@@ -26,64 +58,41 @@ public:
     ProcessMemory() : pid(-1), memFd(-1) {}
 
     ~ProcessMemory() {
-        if (memFd >= 0) {
-            close(memFd);
-        }
+        if (memFd >= 0) close(memFd);
     }
 
     bool attach(pid_t target_pid) {
         pid = target_pid;
-
         const std::string memPath = "/proc/" + std::to_string(pid) + "/mem";
         memFd = open(memPath.c_str(), O_RDWR);
-
-        if (memFd < 0) {
-            std::cerr << "Failed to open " << memPath << ": " << strerror(errno) << std::endl;
-
-            if (errno == EACCES) {
-                std::cerr << "\n=== TROUBLESHOOTING ===\n";
-                std::cerr << "Permission denied.\n\n";
-                std::cerr << "This can happen if:\n";
-                std::cerr << "1. Game runs in a container\n";
-                std::cerr << "2. SELinux/AppArmor is blocking access\n";
-                std::cerr << "3. Process is in different namespace\n\n";
-                std::cerr << "========================\n";
-            }
-
-            return false;
-        }
-
-        std::cout << "Successfully opened /proc/" << pid << "/mem\n";
-        return true;
+        return (memFd >= 0);
     }
 
+    // Вспомогательный метод для чтения любого типа
     template<typename T>
     bool read(uintptr_t address, T& value) {
-        if (pread(memFd, &value, sizeof(T), address) != sizeof(T)) {
-            return false;
-        }
-        return true;
+        return pread(memFd, &value, sizeof(T), address) == sizeof(T);
     }
 
+    // Вспомогательный метод для записи любого типа
     template<typename T>
     bool write(uintptr_t address, const T& value) {
-        if (pwrite(memFd, &value, sizeof(T), address) != sizeof(T)) {
-            return false;
-        }
-        return true;
+        return pwrite(memFd, &value, sizeof(T), address) == sizeof(T);
+    }
+
+    bool writeBytes(uintptr_t address, const std::vector<uint8_t>& data) {
+        return pwrite(memFd, data.data(), data.size(), address) == static_cast<ssize_t>(data.size());
     }
 
     bool readBytes(uintptr_t address, size_t size, std::vector<uint8_t>& buffer) {
         buffer.resize(size);
-        ssize_t nread = pread(memFd, buffer.data(), size, address);
-        return nread == static_cast<ssize_t>(size);
+        return pread(memFd, buffer.data(), size, address) == static_cast<ssize_t>(size);
     }
 
     std::vector<MemoryRegion> getMemoryRegions() {
         std::vector<MemoryRegion> regions;
         std::string mapsPath = "/proc/" + std::to_string(pid) + "/maps";
         std::ifstream mapsFile(mapsPath);
-
         if (!mapsFile.is_open()) return regions;
 
         std::string line;
@@ -91,26 +100,19 @@ public:
             MemoryRegion region;
             size_t dashPos = line.find('-');
             size_t spacePos = line.find(' ');
-
-            if (dashPos == std::string::npos || spacePos == std::string::npos) continue;
+            if (dashPos == std::string::npos) continue;
 
             region.start = std::stoull(line.substr(0, dashPos), nullptr, 16);
             region.end = std::stoull(line.substr(dashPos + 1, spacePos - dashPos - 1), nullptr, 16);
             region.perms = line.substr(spacePos + 1, 4);
 
             size_t pathPos = line.find('/');
-            if (pathPos != std::string::npos) {
-                region.path = line.substr(pathPos);
-            }
-
+            if (pathPos != std::string::npos) region.path = line.substr(pathPos);
             regions.push_back(region);
         }
-
         return regions;
     }
 };
-
-bool isDebug = false;
 
 std::vector<pid_t> findProcessesByName(const std::string& processName) {
     std::vector<pid_t> pids;
@@ -118,348 +120,302 @@ std::vector<pid_t> findProcessesByName(const std::string& processName) {
     if (!dir) return pids;
 
     pid_t myPid = getpid();
-    pid_t parentPid = getppid();
-
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
         if (entry->d_type != DT_DIR) continue;
-
         pid_t pid = atoi(entry->d_name);
-        if (pid <= 0) continue;
-
-        if (pid == myPid || pid == parentPid) continue;
+        if (pid <= 0 || pid == myPid) continue;
 
         std::string cmdlinePath = "/proc/" + std::string(entry->d_name) + "/cmdline";
         std::ifstream cmdlineFile(cmdlinePath);
-        if (!cmdlineFile.is_open()) continue;
-
-        std::string cmdline;
-        std::getline(cmdlineFile, cmdline);
-
-        if (cmdline.find("camera_patcher") != std::string::npos) continue;
-
-        if (cmdline.find(processName) != std::string::npos) {
-            pids.push_back(pid);
+        if (cmdlineFile.is_open()) {
+            std::string cmdline;
+            std::getline(cmdlineFile, cmdline);
+            if (cmdline.find(processName) != std::string::npos) pids.push_back(pid);
         }
     }
-
     closedir(dir);
     return pids;
 }
 
+// ==========================================
+// Pattern Scanning
+// ==========================================
+
+std::vector<int> parsePattern(const std::string& pattern) {
+    std::vector<int> bytes;
+    std::stringstream ss(pattern);
+    std::string byteStr;
+    while (ss >> byteStr) {
+        if (byteStr == "??" || byteStr == "?") bytes.push_back(-1);
+        else bytes.push_back(std::stoi(byteStr, nullptr, 16));
+    }
+    return bytes;
+}
+
+std::vector<uintptr_t> findAllPatterns(ProcessMemory& mem, const MemoryRegion& region, const std::string& patternStr) {
+    std::vector<uintptr_t> results;
+    auto pattern = parsePattern(patternStr);
+    const size_t CHUNK_SIZE = 0x100000; // 1MB chunks
+    std::vector<uint8_t> buffer;
+
+    if (region.perms.find('x') == std::string::npos) return results;
+
+    for (uintptr_t addr = region.start; addr < region.end; addr += CHUNK_SIZE) {
+        size_t readSize = std::min(CHUNK_SIZE, static_cast<size_t>(region.end - addr));
+        if (!mem.readBytes(addr, readSize, buffer)) continue;
+
+        for (size_t i = 0; i <= readSize - pattern.size(); ++i) {
+            bool found = true;
+            for (size_t j = 0; j < pattern.size(); ++j) {
+                if (pattern[j] != -1 && buffer[i + j] != static_cast<uint8_t>(pattern[j])) {
+                    found = false;
+                    break;
+                }
+            }
+            if (found) {
+                results.push_back(addr + i);
+            }
+        }
+    }
+    return results;
+}
+
 uintptr_t scanForCameraAddress(ProcessMemory& mem, const MemoryRegion& region, float targetDistance) {
+    if (region.perms.find('x') != std::string::npos) return 0;
     const size_t CHUNK_SIZE = 0x10000;
     std::vector<uint8_t> buffer;
 
     for (uintptr_t addr = region.start; addr < region.end - sizeof(float); addr += CHUNK_SIZE) {
         size_t readSize = std::min(CHUNK_SIZE, static_cast<size_t>(region.end - addr));
-
         if (!mem.readBytes(addr, readSize, buffer)) continue;
 
         for (size_t i = 0; i <= readSize - sizeof(float); i += 4) {
             float value;
             memcpy(&value, &buffer[i], sizeof(float));
-
-            if (value >= targetDistance - 100 && value <= targetDistance + 100) {
-                uintptr_t foundAddr = addr + i;
-
-                float directValue;
-                if (mem.read(foundAddr, directValue)) {
-                    if (std::abs(directValue - targetDistance) < 100) {
-                        std::cout << "  Found at: 0x" << std::hex << foundAddr
-                                  << " (value: " << std::dec << directValue << ")" << std::endl;
-                        return foundAddr;
-                    }
-                }
+            if (value >= targetDistance - 10 && value <= targetDistance + 10) {
+                return addr + i;
             }
         }
     }
-
     return 0;
 }
 
-void printMenu(bool hasAddress) {
-    std::cout << "\n=== Camera Patcher (Direct Memory Access) ===\n";
-    std::cout << "[1] Scan for camera address\n";
-    
-    if (hasAddress) {
-        std::cout << "[2] Write to specific address\n";
-    }
+// ==========================================
+// Weather Logic (IMPROVED)
+// ==========================================
 
-    if (isDebug) {
-        std::cout << "[3] Read from specific address\n";
-        std::cout << "[4] Set distance by offset\n";
-        std::cout << "[5] Show memory regions\n";
-    }
+struct CachedPatchLocation {
+    uintptr_t address;
+    size_t originalSize;
+    std::string typeName;
+};
 
-    std::cout << "[0] Exit\n";
-    std::cout << "\n=> ";
-}
+class WeatherManager {
+    std::vector<CachedPatchLocation> locations;
+    bool isScanned = false;
 
-void showMemoryRegions(const std::vector<MemoryRegion>& regions) {
-    std::cout << "\n=== Memory Regions ===\n";
-    for (const auto& region : regions) {
-        if (region.path.find("client.so") != std::string::npos ||
-            region.path.find("libclient") != std::string::npos ||
-            region.path.find("server.so") != std::string::npos) {
-            std::cout << "0x" << std::hex << std::setw(16) << std::setfill('0') << region.start
-                      << " - 0x" << std::setw(16) << region.end << std::dec
-                      << " [" << region.perms << "] " << region.path << std::endl;
+    struct PatternDef {
+        std::string name;
+        std::string signature;
+    };
+
+    const std::vector<PatternDef> PATTERNS = {
+        { "Particles", "48 63 83 DC 0A 00 00" }, // MOVSXD RAX, [RBX+0xADC]
+        { "Lighting",  "8B 83 DC 0A 00 00"    }  // MOV EAX, [RBX+0xADC]
+    };
+
+public:
+    void scan(ProcessMemory& mem, const std::vector<MemoryRegion>& regions) {
+        if (isScanned) return;
+
+        std::cout << YELLOW << "[*] Scanning memory for weather signatures..." << RESET << "\n";
+
+        for (const auto& region : regions) {
+            for (const auto& pat : PATTERNS) {
+                auto foundAddrs = findAllPatterns(mem, region, pat.signature);
+                size_t sigSize = parsePattern(pat.signature).size();
+
+                for (auto addr : foundAddrs) {
+                    locations.push_back({ addr, sigSize, pat.name });
+                }
+            }
         }
-    }
-}
 
-void printHelp() {
-    std::cout << "Camera Patcher (Linux)\n";
-    std::cout << "=================================\n\n";
-    std::cout << "Usage:\n";
-    std::cout << "  sudo ./camera_patcher [options]\n\n";
-    std::cout << "Options:\n";
-    std::cout << "  --help   Show this help message and exit.\n";
-    std::cout << "  --debug  Enable additional debug menu options (Read, Offset, Regions).\n\n";
-}
-
-int main(int argc, char* argv[]) {
-    // Check for --help first, before printing anything else
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--help") {
-            printHelp();
-            return 0;
-        }
-    }
-
-    std::cout << "Camera Patcher (Direct /proc/mem access)\n";
-    std::cout << "================================================\n\n";
-
-    std::cout << "Arguments:" << "\n";
-
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-
-        std::cout << arg << "\n";
-
-        if (arg == "--debug") {
-            isDebug = true;
-            std::cout << "is debug";
+        if (locations.empty()) {
+            std::cout << RED << "[!] No weather signatures found! Game might be updated." << RESET << "\n";
+        } else {
+            std::cout << GREEN << "[+] Found " << locations.size() << " patch locations." << RESET << "\n";
+            isScanned = true;
         }
     }
 
-    std::cout << "\n";
+    void applyWeather(ProcessMemory& mem, int weatherId) {
+        if (!isScanned) {
+            std::cout << RED << "[!] Error: Not scanned yet." << RESET << "\n";
+            return;
+        }
+
+        if (locations.empty()) {
+            std::cout << RED << "[!] No locations to patch." << RESET << "\n";
+            return;
+        }
+
+        std::vector<uint8_t> patch;
+        // Генерируем инструкцию: MOV EAX, weatherId (B8 XX XX XX XX) -> 5 байт
+        patch.push_back(0xB8);
+        patch.resize(5);
+        memcpy(&patch[1], &weatherId, sizeof(int));
+
+        int successCount = 0;
+        for (const auto& loc : locations) {
+            // Создаем копию патча для конкретного места, чтобы добить NOP-ами
+            std::vector<uint8_t> currentPatch = patch;
+            while (currentPatch.size() < loc.originalSize) {
+                currentPatch.push_back(0x90); // NOP
+            }
+
+            if (mem.writeBytes(loc.address, currentPatch)) {
+                successCount++;
+            }
+        }
+
+        std::cout << GREEN << "[+] Weather ID " << weatherId << " applied to " << successCount << " locations." << RESET << "\n";
+        std::cout << BLUE << "(Move your camera or reconnect to see changes for Sky)" << RESET << "\n";
+    }
+
+    bool hasFoundLocations() const { return !locations.empty(); }
+};
+
+// ==========================================
+// Main & UI
+// ==========================================
+
+void printWeatherList() {
+    std::cout << "\n" << BOLD << "Available Weather IDs:" << RESET << "\n";
+    std::cout << std::left << std::setw(20) << "1  - Snow" << std::setw(20) << "2  - Rain" << "\n";
+    std::cout << std::left << std::setw(20) << "3  - Moonbeam" << std::setw(20) << "4  - Pestilence" << "\n";
+    std::cout << std::left << std::setw(20) << "5  - Harvest" << std::setw(20) << "6  - Sirocco" << "\n";
+    std::cout << std::left << std::setw(20) << "7  - Spring" << std::setw(20) << "8  - Ash" << "\n";
+    std::cout << std::left << std::setw(20) << "9  - Aurora" << std::setw(20) << "0  - Default" << "\n";
+}
+
+int main(int, char**) {
+    printBanner();
 
     if (geteuid() != 0) {
-        std::cerr << "WARNING: Not running as root!\n";
-        std::cerr << "This program requires root privileges.\n";
-        std::cerr << "Please run: sudo ./camera_patcher\n\n";
+        std::cerr << RED << "[!] ROOT REQUIRED. Run with sudo." << RESET << "\n";
         return 1;
     }
-
-    std::cout << "Searching for game processes...\n";
 
     auto pids = findProcessesByName("dota2");
     if (pids.empty()) {
-        std::cerr << "ERROR: No game process found!\n";
-        std::cerr << "Make sure Dota 2 is running.\n";
+        std::cerr << RED << "[!] Dota 2 process not found. Launch the game first." << RESET << "\n";
         return 1;
     }
-
-    std::cout << "Found " << pids.size() << " game process(es):\n";
-    for (size_t i = 0; i < pids.size(); i++) {
-        std::cout << "  [" << i << "] PID: " << pids[i];
-
-        std::string statusPath = "/proc/" + std::to_string(pids[i]) + "/status";
-        std::ifstream statusFile(statusPath);
-        if (statusFile.is_open()) {
-            std::string line;
-            while (std::getline(statusFile, line)) {
-                if (line.find("VmRSS:") == 0) {
-                    std::cout << " - Memory: " << line.substr(7);
-                    break;
-                }
-            }
-        }
-
-        std::ifstream cmdline("/proc/" + std::to_string(pids[i]) + "/cmdline");
-        if (cmdline.is_open()) {
-            std::string cmd;
-            std::getline(cmdline, cmd);
-
-            for (char& c : cmd) {
-                if (c == '\0') c = ' ';
-            }
-            if (cmd.length() > 80) cmd = cmd.substr(0, 77) + "...";
-            std::cout << "\n      " << cmd;
-        }
-        std::cout << std::endl;
-    }
-
-    pid_t dotaPid;
-    if (pids.size() == 1) {
-        dotaPid = pids[0];
-        std::cout << "\nAuto-selected PID: " << dotaPid << std::endl;
-    } else if (pids.size() == 0) {
-        std::cerr << "No valid game process found!\n";
-        std::cerr << "Make sure you're in a game (not just the menu)\n";
-        return 1;
-    } else {
-        std::cout << "\n💡 Tip: Choose the process with the LARGEST memory usage\n";
-        std::cout << "Select process [0-" << pids.size()-1 << "]: ";
-        int choice;
-        std::cin >> choice;
-        if (choice < 0 || choice >= static_cast<int>(pids.size())) {
-            std::cerr << "Invalid choice\n";
-            return 1;
-        }
-        dotaPid = pids[choice];
-    }
+    pid_t dotaPid = pids[0];
+    std::cout << "[*] Attached to Dota 2 PID: " << GREEN << dotaPid << RESET << "\n";
 
     ProcessMemory mem;
     if (!mem.attach(dotaPid)) {
-        std::cerr << "ERROR: Failed to attach.\n";
+        std::cerr << RED << "[!] Failed to open process memory." << RESET << "\n";
         return 1;
     }
 
-    std::cout << "Analyzing memory regions...\n";
-
+    // Предварительный поиск регионов
+    std::cout << "[*] Parsing memory maps...\n";
     auto regions = mem.getMemoryRegions();
     std::vector<MemoryRegion> clientRegions;
-
-    std::cout << "Looking for game modules...\n";
+    std::vector<MemoryRegion> dataRegions;
 
     for (const auto& region : regions) {
-        bool isGameModule = false;
-
-        if (region.path.find("client") != std::string::npos ||
-            region.path.find("dota2") != std::string::npos ||
-            region.path.find("game/bin") != std::string::npos ||
-            region.path.find("libclient") != std::string::npos) {
-
-            if (region.perms.find('w') != std::string::npos) {
-                //std::cout << "  Found: " << region.path << " [" << region.perms << "]\n";
-                clientRegions.push_back(region);
-                isGameModule = true;
-            }
+        if (region.path.find("libclient.so") != std::string::npos ||
+            region.path.find("client.dll") != std::string::npos) {
+            if (region.perms.find('x') != std::string::npos) clientRegions.push_back(region);
+            else if (region.perms.find("rw") != std::string::npos) dataRegions.push_back(region);
         }
     }
 
-    if (clientRegions.empty()) {
-        std::cerr << "\nERROR: No writable game modules found!\n";
-        std::cerr << "\nShowing all mapped files:\n";
+    std::cout << "[*] Found " << clientRegions.size() << " executable regions.\n";
 
-        for (const auto& region : regions) {
-            if (!region.path.empty() && region.path[0] == '/') {
-                std::cout << "  " << region.path << " [" << region.perms << "]\n";
-            }
-        }
-
-        std::cerr << "\nMake sure you are IN A GAME (not in menu)!\n";
-        return 1;
-    }
-
-    std::cout << "\n Found " << clientRegions.size() << " writable game region(s)\n";
-
-    int choice;
+    WeatherManager weatherMgr;
+    uintptr_t cameraAddr = 0;
     bool running = true;
-    uintptr_t lastFoundAddress = 0;
+    float currentCamDist = 1200.0f;
+
+    // Сразу сканируем погоду при запуске, чтобы сохранить оригинальные адреса
+    weatherMgr.scan(mem, clientRegions);
+
+    // Пауза перед входом в меню
+    std::cout << "\nPress Enter to continue...";
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
     while (running) {
-        printMenu(lastFoundAddress != 0);
-        std::cin >> choice;
+        printBanner();
 
-        std::cout << "\033[2J\033[1;1H";
+        // Status Info
+        std::cout << "Camera Status: " << (cameraAddr != 0 ? (GREEN + "LINKED") : (RED + "NOT LINKED")) << RESET;
+        if (cameraAddr != 0) std::cout << " (" << currentCamDist << ")";
+        std::cout << "\nWeather Status: " << (weatherMgr.hasFoundLocations() ? (GREEN + "READY") : (RED + "NOT FOUND")) << RESET << "\n";
+        std::cout << "------------------------------------------------------\n";
+
+        std::cout << BOLD << "[1]" << RESET << " Setup Camera Distance\n";
+        std::cout << BOLD << "[2]" << RESET << " Change Weather\n";
+        std::cout << BOLD << "[0]" << RESET << " Exit\n";
+        std::cout << "\n" << CYAN << "=> " << RESET;
+
+        int choice;
+        if (!(std::cin >> choice)) {
+            std::cin.clear();
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            continue;
+        }
+
+        if (choice == 0) break;
 
         switch (choice) {
             case 1: {
-                float currentDistance = 1200.0f;
-                std::cout << "Enter CURRENT camera distance [1200]: ";
-
-                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-                std::string line;
-                std::getline(std::cin, line);
-
-                if (!line.empty()) {
-                    try {
-                        currentDistance = std::stof(line);
-                    } catch (...) {}
-                }
-
-                std::cout << "\nScanning...\n";
-                for (const auto& region : clientRegions) {
-                    uintptr_t found = scanForCameraAddress(mem, region, currentDistance);
-                    if (found != 0) {
-                        lastFoundAddress = found;
-                        std::cout << "\n*** FOUND: 0x" << std::hex << found << std::dec << " ***\n";
-                        break;
+                if (cameraAddr == 0) {
+                    std::cout << "\nEnter current in-game distance (default 1200 or 1134): ";
+                    float scanVal;
+                    std::cin >> scanVal;
+                    std::cout << YELLOW << "Scanning..." << RESET << "\n";
+                    for (const auto& region : dataRegions) {
+                        cameraAddr = scanForCameraAddress(mem, region, scanVal);
+                        if (cameraAddr != 0) break;
                     }
                 }
+
+                if (cameraAddr != 0) {
+                    std::cout << GREEN << "[+] Found Camera at 0x" << std::hex << cameraAddr << std::dec << RESET << "\n";
+                    std::cout << "Enter new distance (e.g., 1400, 1350): ";
+                    float val;
+                    std::cin >> val;
+                    if (mem.write(cameraAddr, val)) {
+                        currentCamDist = val;
+                        std::cout << GREEN << "Done!" << RESET << "\n";
+                    } else {
+                        std::cout << RED << "Write failed." << RESET << "\n";
+                    }
+                } else {
+                    std::cout << RED << "[-] Camera entity not found. Try moving camera ingame." << RESET << "\n";
+                }
+                sleep(2);
                 break;
             }
             case 2: {
-                if (lastFoundAddress == 0) {
-                     std::cout << "Not valid key";
-                     break;
-                }
-                uintptr_t address = lastFoundAddress;
-                float value;
+                printWeatherList();
+                std::cout << "\n" << CYAN << "Select ID: " << RESET;
+                int id;
+                std::cin >> id;
 
-                /*
-                if (address == 0) {
-                    std::cout << "No Address";
-                    //std::cin >> std::hex >> address >> std::dec;
-                }
-                */
+                weatherMgr.applyWeather(mem, id);
 
-                std::cout << "Value: ";
-                std::cin >> value;
-
-                if (mem.write(address, value)) {
-                    std::cout << "Written " << value << " to 0x" << std::hex << address << std::dec << std::endl;
-                } else {
-                    std::cerr << "Failed\n";
-                }
-
+                std::cout << "\nPress Enter to return...";
+                std::cin.ignore();
+                std::cin.get();
                 break;
             }
-            case 3: {
-                uintptr_t address;
-                std::cout << "Address (hex): 0x";
-                std::cin >> std::hex >> address >> std::dec;
-
-                float value;
-                if (mem.read(address, value)) {
-                    std::cout << "Value: " << value << std::endl;
-                } else {
-                    std::cerr << "❌ Failed\n";
-                }
-                break;
-            }
-            case 4: {
-                uintptr_t baseAddr;
-                uint32_t offset;
-                float value;
-
-                std::cout << "Base (hex): 0x";
-                std::cin >> std::hex >> baseAddr >> std::dec;
-                std::cout << "Offset (hex): 0x";
-                std::cin >> std::hex >> offset >> std::dec;
-                std::cout << "Value: ";
-                std::cin >> value;
-
-                if (mem.write(baseAddr + offset, value)) {
-                    std::cout << "✅ Done\n";
-                } else {
-                    std::cerr << "❌ Failed\n";
-                }
-                break;
-            }
-            case 5:
-                showMemoryRegions(regions);
-                break;
-            case 0:
-                running = false;
-                break;
-            default:
-                std::cout << "Not valid key";
         }
     }
 
