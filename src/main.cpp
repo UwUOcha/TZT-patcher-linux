@@ -371,9 +371,11 @@ int main(int, char**) {
             continue;
         }
 
-        if (choice == 0) break;
-
         switch (choice) {
+            case 0: {
+                running = false;
+                break;
+            }
             case 1: {
                 if (cameraAddr == 0) {
                     std::cout << "\nEnter current in-game distance (default 1200 or 1134): ";
@@ -400,7 +402,6 @@ int main(int, char**) {
                 } else {
                     std::cout << RED << "[-] Camera entity not found. Try moving camera ingame." << RESET << "\n";
                 }
-                sleep(2);
                 break;
             }
             case 2: {
