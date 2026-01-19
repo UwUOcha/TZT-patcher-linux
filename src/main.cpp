@@ -12,11 +12,7 @@
 #include <limits>
 #include <algorithm>
 #include <sstream>
-#include <map>
 
-// ==========================================
-// Visual Styles & Colors
-// ==========================================
 const std::string RESET   = "\033[0m";
 const std::string RED     = "\033[31m";
 const std::string GREEN   = "\033[32m";
@@ -38,10 +34,6 @@ void printBanner() {
               << "║        " << RESET << "Camera Distance & Weather Changer" << CYAN << BOLD << "         ║\n"
               << "╚════════════════════════════════════════════════════╝" << RESET << "\n\n";
 }
-
-// ==========================================
-// Memory Classes
-// ==========================================
 
 struct MemoryRegion {
     uintptr_t start;
@@ -68,28 +60,26 @@ public:
         return (memFd >= 0);
     }
 
-    // Вспомогательный метод для чтения любого типа
     template<typename T>
     bool read(uintptr_t address, T& value) {
         return pread(memFd, &value, sizeof(T), address) == sizeof(T);
     }
 
-    // Вспомогательный метод для записи любого типа
     template<typename T>
     bool write(uintptr_t address, const T& value) {
         return pwrite(memFd, &value, sizeof(T), address) == sizeof(T);
     }
 
-    bool writeBytes(uintptr_t address, const std::vector<uint8_t>& data) {
+    bool writeBytes(uintptr_t address, const std::vector<uint8_t>& data) const {
         return pwrite(memFd, data.data(), data.size(), address) == static_cast<ssize_t>(data.size());
     }
 
-    bool readBytes(uintptr_t address, size_t size, std::vector<uint8_t>& buffer) {
+    bool readBytes(uintptr_t address, size_t size, std::vector<uint8_t>& buffer) const {
         buffer.resize(size);
         return pread(memFd, buffer.data(), size, address) == static_cast<ssize_t>(size);
     }
 
-    std::vector<MemoryRegion> getMemoryRegions() {
+    std::vector<MemoryRegion> getMemoryRegions() const {
         std::vector<MemoryRegion> regions;
         std::string mapsPath = "/proc/" + std::to_string(pid) + "/maps";
         std::ifstream mapsFile(mapsPath);
@@ -138,10 +128,6 @@ std::vector<pid_t> findProcessesByName(const std::string& processName) {
     return pids;
 }
 
-// ==========================================
-// Pattern Scanning
-// ==========================================
-
 std::vector<int> parsePattern(const std::string& pattern) {
     std::vector<int> bytes;
     std::stringstream ss(pattern);
@@ -153,16 +139,18 @@ std::vector<int> parsePattern(const std::string& pattern) {
     return bytes;
 }
 
-std::vector<uintptr_t> findAllPatterns(ProcessMemory& mem, const MemoryRegion& region, const std::string& patternStr) {
-    std::vector<uintptr_t> results;
-    auto pattern = parsePattern(patternStr);
-    const size_t CHUNK_SIZE = 0x100000; // 1MB chunks
-    std::vector<uint8_t> buffer;
+std::vector<uintptr_t> findAllPatterns(const ProcessMemory& mem, const MemoryRegion& region, const std::string& patternStr) {
+    if (region.perms.find('x') == std::string::npos)
+        return {};
 
-    if (region.perms.find('x') == std::string::npos) return results;
+    const auto pattern = parsePattern(patternStr);
+    constexpr size_t CHUNK_SIZE = 0x100000; // 1MB chunks
+
+    std::vector<uint8_t> buffer;
+    std::vector<uintptr_t> results;
 
     for (uintptr_t addr = region.start; addr < region.end; addr += CHUNK_SIZE) {
-        size_t readSize = std::min(CHUNK_SIZE, static_cast<size_t>(region.end - addr));
+        const size_t readSize = std::min(CHUNK_SIZE, static_cast<size_t>(region.end - addr));
         if (!mem.readBytes(addr, readSize, buffer)) continue;
 
         for (size_t i = 0; i <= readSize - pattern.size(); ++i) {
@@ -181,9 +169,9 @@ std::vector<uintptr_t> findAllPatterns(ProcessMemory& mem, const MemoryRegion& r
     return results;
 }
 
-uintptr_t scanForCameraAddress(ProcessMemory& mem, const MemoryRegion& region, float targetDistance) {
+uintptr_t scanForCameraAddress(const ProcessMemory& mem, const MemoryRegion& region, float targetDistance) {
     if (region.perms.find('x') != std::string::npos) return 0;
-    const size_t CHUNK_SIZE = 0x10000;
+    constexpr size_t CHUNK_SIZE = 0x10000;
     std::vector<uint8_t> buffer;
 
     for (uintptr_t addr = region.start; addr < region.end - sizeof(float); addr += CHUNK_SIZE) {
@@ -200,10 +188,6 @@ uintptr_t scanForCameraAddress(ProcessMemory& mem, const MemoryRegion& region, f
     }
     return 0;
 }
-
-// ==========================================
-// Weather Logic (IMPROVED)
-// ==========================================
 
 struct CachedPatchLocation {
     uintptr_t address;
@@ -226,7 +210,7 @@ class WeatherManager {
     };
 
 public:
-    void scan(ProcessMemory& mem, const std::vector<MemoryRegion>& regions) {
+    void scan(const ProcessMemory& mem, const std::vector<MemoryRegion>& regions) {
         if (isScanned) return;
 
         std::cout << YELLOW << "[*] Scanning memory for weather signatures..." << RESET << "\n";
@@ -234,9 +218,9 @@ public:
         for (const auto& region : regions) {
             for (const auto& pat : PATTERNS) {
                 auto foundAddrs = findAllPatterns(mem, region, pat.signature);
-                size_t sigSize = parsePattern(pat.signature).size();
+                const size_t sigSize = parsePattern(pat.signature).size();
 
-                for (auto addr : foundAddrs) {
+                for (const auto addr : foundAddrs) {
                     locations.push_back({ addr, sigSize, pat.name });
                 }
             }
@@ -250,7 +234,7 @@ public:
         }
     }
 
-    void applyWeather(ProcessMemory& mem, int weatherId) {
+    void applyWeather(const ProcessMemory& mem, int weatherId) const {
         if (!isScanned) {
             std::cout << RED << "[!] Error: Not scanned yet." << RESET << "\n";
             return;
@@ -262,17 +246,16 @@ public:
         }
 
         std::vector<uint8_t> patch;
-        // Генерируем инструкцию: MOV EAX, weatherId (B8 XX XX XX XX) -> 5 байт
+
         patch.push_back(0xB8);
         patch.resize(5);
         memcpy(&patch[1], &weatherId, sizeof(int));
 
         int successCount = 0;
         for (const auto& loc : locations) {
-            // Создаем копию патча для конкретного места, чтобы добить NOP-ами
             std::vector<uint8_t> currentPatch = patch;
             while (currentPatch.size() < loc.originalSize) {
-                currentPatch.push_back(0x90); // NOP
+                currentPatch.push_back(0x90);
             }
 
             if (mem.writeBytes(loc.address, currentPatch)) {
@@ -286,10 +269,6 @@ public:
 
     bool hasFoundLocations() const { return !locations.empty(); }
 };
-
-// ==========================================
-// Main & UI
-// ==========================================
 
 void printWeatherList() {
     std::cout << "\n" << BOLD << "Available Weather IDs:" << RESET << "\n";
@@ -322,7 +301,6 @@ int main(int, char**) {
         return 1;
     }
 
-    // Предварительный поиск регионов
     std::cout << "[*] Parsing memory maps...\n";
     auto regions = mem.getMemoryRegions();
     std::vector<MemoryRegion> clientRegions;
@@ -343,17 +321,14 @@ int main(int, char**) {
     bool running = true;
     float currentCamDist = 1200.0f;
 
-    // Сразу сканируем погоду при запуске, чтобы сохранить оригинальные адреса
     weatherMgr.scan(mem, clientRegions);
 
-    // Пауза перед входом в меню
     std::cout << "\nPress Enter to continue...";
     std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
     while (running) {
         printBanner();
 
-        // Status Info
         std::cout << "Camera Status: " << (cameraAddr != 0 ? (GREEN + "LINKED") : (RED + "NOT LINKED")) << RESET;
         if (cameraAddr != 0) std::cout << " (" << currentCamDist << ")";
         std::cout << "\nWeather Status: " << (weatherMgr.hasFoundLocations() ? (GREEN + "READY") : (RED + "NOT FOUND")) << RESET << "\n";
