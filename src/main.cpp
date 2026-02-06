@@ -31,7 +31,7 @@ void printBanner() {
     std::cout << CYAN << BOLD
               << "╔════════════════════════════════════════════════════╗\n"
               << "║              EXTERNAL PATCHER (LINUX)              ║\n"
-              << "║        " << RESET << "Camera Distance & Weather Changer" << CYAN << BOLD << "         ║\n"
+              << "║        " << RESET << "Camera Distance & Weather Changer  " << CYAN << BOLD << "         ║\n"
               << "╚════════════════════════════════════════════════════╝" << RESET << "\n\n";
 }
 
