@@ -12,6 +12,7 @@
 #include <limits>
 #include <algorithm>
 #include <sstream>
+#include <map>
 
 const std::string RESET   = "\033[0m";
 const std::string RED     = "\033[31m";
@@ -61,12 +62,12 @@ public:
     }
 
     template<typename T>
-    bool read(uintptr_t address, T& value) {
+    bool read(uintptr_t address, T& value) const {
         return pread(memFd, &value, sizeof(T), address) == sizeof(T);
     }
 
     template<typename T>
-    bool write(uintptr_t address, const T& value) {
+    bool write(uintptr_t address, const T& value) const {
         return pwrite(memFd, &value, sizeof(T), address) == sizeof(T);
     }
 
@@ -191,25 +192,38 @@ uintptr_t scanForCameraAddress(const ProcessMemory& mem, const MemoryRegion& reg
     return 0;
 }
 
-struct CachedPatchLocation {
-    uintptr_t address;
-    size_t originalSize;
-    std::string typeName;
-};
-
 class WeatherManager {
-    std::vector<CachedPatchLocation> locations;
+    // Одно совпадение инструкции, читающей поле [RBX+disp].
+    struct Hit {
+        uintptr_t address;
+        std::string type;   // "Particles" (movsxd) или "Lighting" (mov)
+        uint32_t disp;      // реальное смещение, прочитанное из инструкции
+        size_t size;        // длина инструкции (сколько байт перезаписываем)
+    };
+
+    // Снимок оригинальных байтов — чтобы откатить пробный патч.
+    struct SavedBytes {
+        uintptr_t address;
+        std::vector<uint8_t> bytes;
+    };
+
+    std::vector<Hit> allHits;          // все найденные чтения [RBX+small]
+    std::vector<SavedBytes> backup;    // оригиналы текущего НЕподтверждённого патча
+    uint32_t resolvedOffset = 0;       // подтверждённый оффсет погоды
     bool isScanned = false;
+    bool locked = false;               // оффсет подтверждён сменой погоды в игре
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  ОФФСЕТ ПОЛЯ ПОГОДЫ В КЛАССЕ.
-    //  Это смещение поля "тип погоды" внутри игрового объекта (RBX = указатель
-    //  на объект). В дизассемблере оно выглядит как [RBX+0xADC].
-    //  Когда выходит патч Dota и смена погоды ломается — нужно найти новое
-    //  значение в Binary Ninja и поменять ТОЛЬКО эту одну строку, затем
-    //  пересобрать программу (make).
+    //  HINT_OFFSET — последний РАБОЧИЙ оффсет погоды. По одним байтам отличить
+    //  поле погоды от сотни других полей нельзя, поэтому единственный надёжный
+    //  критерий — реально ли поменялась погода в игре. Перебор идёт от кандидатов,
+    //  ближайших к этому числу. Когда подтвердишь новый оффсет — впиши его сюда,
+    //  чтобы в следующий раз перебор начинался прямо с него.
     // ─────────────────────────────────────────────────────────────────────────
-    static constexpr uint32_t WEATHER_OFFSET = 0xADC;
+    static constexpr uint32_t HINT_OFFSET = 0xADC;
+    static constexpr uint32_t MIN_OFFSET  = 0x100;  // нижняя граница разумного смещения
+    static constexpr uint32_t MAX_OFFSET  = 0x4000; // верхняя граница разумного смещения
+    static constexpr uint32_t TRIAL_WINDOW = 0x80;  // насколько далеко от HINT перебираем
 
     struct PatternDef {
         std::string name;
@@ -217,81 +231,128 @@ class WeatherManager {
     };
 
     const std::vector<PatternDef> PATTERNS = {
-        { "Particles", "48 63 83" }, // MOVSXD RAX, [RBX+WEATHER_OFFSET]
-        { "Lighting",  "8B 83"    }  // MOV   EAX, [RBX+WEATHER_OFFSET]
+        { "Particles", "48 63 83" }, // MOVSXD RAX, [RBX+offset]
+        { "Lighting",  "8B 83"    }  // MOV   EAX, [RBX+offset]
     };
 
-    // Склеивает префикс опкода с 4 байтами смещения (little-endian).
-    static std::vector<int> buildSignature(const std::string& opcodePrefix) {
-        std::vector<int> sig = parsePattern(opcodePrefix);
-        for (int i = 0; i < 4; ++i)
-            sig.push_back(static_cast<int>((WEATHER_OFFSET >> (i * 8)) & 0xFF));
-        return sig;
+    static uint32_t absDiff(uint32_t a, uint32_t b) { return a > b ? a - b : b - a; }
+
+    // Байты патча "mov eax, id" + NOP-добивка до длины инструкции.
+    static std::vector<uint8_t> makePatch(int weatherId, size_t size) {
+        std::vector<uint8_t> p(5, 0);
+        p[0] = 0xB8;
+        memcpy(&p[1], &weatherId, sizeof(int));
+        while (p.size() < size) p.push_back(0x90);
+        return p;
+    }
+
+    // Все совпадения с данным смещением.
+    std::vector<const Hit*> hitsForOffset(uint32_t offset) const {
+        std::vector<const Hit*> out;
+        for (const auto& h : allHits)
+            if (h.disp == offset) out.push_back(&h);
+        return out;
     }
 
 public:
+    uint32_t getOffset() const { return resolvedOffset; }
+    bool hasCandidates() const { return !allHits.empty(); }
+    bool isLocked() const { return locked; }
+
     void scan(const ProcessMemory& mem, const std::vector<MemoryRegion>& regions) {
         if (isScanned) return;
 
-        std::cout << YELLOW << "[*] Scanning memory for weather signatures (offset 0x"
-                  << std::hex << WEATHER_OFFSET << std::dec << ")..." << RESET << "\n";
+        std::cout << YELLOW << "[*] Scanning weather instructions (baseline 0x"
+                  << std::hex << HINT_OFFSET << std::dec << ")..." << RESET << "\n";
 
-        // Сигнатуры собираем один раз, а не на каждом регионе.
-        std::vector<std::pair<std::string, std::vector<int>>> signatures;
-        for (const auto& pat : PATTERNS)
-            signatures.emplace_back(pat.name, buildSignature(pat.opcodePrefix));
+        // Маски с "дыркой" вместо 32-битного смещения:
+        //   8B 83 ?? ?? 00 00       MOV    EAX, [RBX+offset]
+        //   48 63 83 ?? ?? 00 00    MOVSXD RAX, [RBX+offset]
+        // Старшие 2 байта смещения держим нулевыми => только небольшие оффсеты.
+        struct WildPattern { std::string name; std::vector<int> sig; size_t prefixLen; };
+        std::vector<WildPattern> wilds;
+        for (const auto& pat : PATTERNS) {
+            std::vector<int> sig = parsePattern(pat.opcodePrefix);
+            const size_t prefixLen = sig.size();
+            sig.push_back(-1);   sig.push_back(-1);
+            sig.push_back(0x00); sig.push_back(0x00);
+            wilds.push_back({ pat.name, std::move(sig), prefixLen });
+        }
 
         for (const auto& region : regions) {
-            for (const auto& [name, signature] : signatures) {
-                auto foundAddrs = findAllPatterns(mem, region, signature);
-                for (const auto addr : foundAddrs) {
-                    locations.push_back({ addr, signature.size(), name });
+            for (const auto& w : wilds) {
+                for (const auto addr : findAllPatterns(mem, region, w.sig)) {
+                    uint32_t disp = 0;
+                    if (!mem.read(addr + w.prefixLen, disp)) continue;
+                    if (disp < MIN_OFFSET || disp > MAX_OFFSET) continue;
+                    allHits.push_back({ addr, w.name, disp, w.sig.size() });
                 }
             }
         }
 
-        if (locations.empty()) {
-            std::cout << RED << "[!] No weather signatures found! Game might be updated." << RESET << "\n";
-        } else {
-            std::cout << GREEN << "[+] Found " << locations.size() << " patch locations." << RESET << "\n";
-            isScanned = true;
-        }
+        isScanned = true;
+        if (allHits.empty())
+            std::cout << RED << "[!] No candidate instructions found. Game changed too much." << RESET << "\n";
+        else
+            std::cout << GREEN << "[+] Collected " << allHits.size()
+                      << " candidate reads. Use [3] to auto-tune the offset." << RESET << "\n";
     }
 
-    void applyWeather(const ProcessMemory& mem, int weatherId) const {
-        if (!isScanned) {
-            std::cout << RED << "[!] Error: Not scanned yet." << RESET << "\n";
+    // Уникальные смещения в окне вокруг HINT, отсортированные по близости к нему.
+    std::vector<uint32_t> trialOffsets() const {
+        std::vector<uint32_t> offs;
+        for (const auto& h : allHits)
+            if (absDiff(h.disp, HINT_OFFSET) <= TRIAL_WINDOW)
+                offs.push_back(h.disp);
+        std::sort(offs.begin(), offs.end());
+        offs.erase(std::unique(offs.begin(), offs.end()), offs.end());
+        std::sort(offs.begin(), offs.end(), [](uint32_t a, uint32_t b) {
+            return absDiff(a, HINT_OFFSET) < absDiff(b, HINT_OFFSET);
+        });
+        return offs;
+    }
+
+    // Запатчить ВСЕ инструкции с данным смещением, предварительно сохранив оригиналы.
+    // Сколько мест записано — столько и возвращаем.
+    int applyAt(const ProcessMemory& mem, uint32_t offset, int weatherId, bool keepBackup) {
+        backup.clear();
+        int count = 0;
+        for (const Hit* h : hitsForOffset(offset)) {
+            std::vector<uint8_t> orig;
+            if (keepBackup && mem.readBytes(h->address, h->size, orig))
+                backup.push_back({ h->address, orig });
+            if (mem.writeBytes(h->address, makePatch(weatherId, h->size)))
+                count++;
+        }
+        if (!keepBackup) backup.clear();
+        return count;
+    }
+
+    // Вернуть оригинальные байты последнего пробного патча.
+    void revert(const ProcessMemory& mem) {
+        for (const auto& s : backup)
+            mem.writeBytes(s.address, s.bytes);
+        backup.clear();
+    }
+
+    // Зафиксировать найденный оффсет как рабочий.
+    void lock(uint32_t offset) {
+        resolvedOffset = offset;
+        locked = true;
+        backup.clear(); // подтверждённый патч откатывать не нужно
+    }
+
+    // Обычная смена погоды по уже подтверждённому оффсету.
+    void applyWeather(const ProcessMemory& mem, int weatherId) {
+        if (!locked) {
+            std::cout << RED << "[!] Offset not confirmed yet. Run [3] Auto-tune first." << RESET << "\n";
             return;
         }
-
-        if (locations.empty()) {
-            std::cout << RED << "[!] No locations to patch." << RESET << "\n";
-            return;
-        }
-
-        std::vector<uint8_t> patch;
-
-        patch.push_back(0xB8);
-        patch.resize(5);
-        memcpy(&patch[1], &weatherId, sizeof(int));
-
-        int successCount = 0;
-        for (const auto& loc : locations) {
-            std::vector<uint8_t> currentPatch = patch;
-            while (currentPatch.size() < loc.originalSize) {
-                currentPatch.push_back(0x90);
-            }
-
-            if (mem.writeBytes(loc.address, currentPatch)) {
-                successCount++;
-            }
-        }
-
-        std::cout << GREEN << "[+] Weather ID " << weatherId << " applied to " << successCount << " locations." << RESET << "\n";
+        const int count = applyAt(mem, resolvedOffset, weatherId, false);
+        std::cout << GREEN << "[+] Weather ID " << weatherId << " applied to " << count
+                  << " locations (offset 0x" << std::hex << resolvedOffset << std::dec << ")." << RESET << "\n";
         std::cout << BLUE << "(Move your camera or reconnect to see changes for Sky)" << RESET << "\n";
     }
-
-    bool hasFoundLocations() const { return !locations.empty(); }
 };
 
 void printWeatherList() {
@@ -355,11 +416,19 @@ int main(int, char**) {
 
         std::cout << "Camera Status: " << (cameraAddr != 0 ? (GREEN + "LINKED") : (RED + "NOT LINKED")) << RESET;
         if (cameraAddr != 0) std::cout << " (" << currentCamDist << ")";
-        std::cout << "\nWeather Status: " << (weatherMgr.hasFoundLocations() ? (GREEN + "READY") : (RED + "NOT FOUND")) << RESET << "\n";
+        std::cout << "\nWeather Status: ";
+        if (weatherMgr.isLocked())
+            std::cout << GREEN << "READY (offset 0x" << std::hex << weatherMgr.getOffset() << std::dec << ")" << RESET;
+        else if (weatherMgr.hasCandidates())
+            std::cout << YELLOW << "NEEDS TUNING (run [3])" << RESET;
+        else
+            std::cout << RED << "NOT FOUND" << RESET;
+        std::cout << "\n";
         std::cout << "------------------------------------------------------\n";
 
         std::cout << BOLD << "[1]" << RESET << " Setup Camera Distance\n";
         std::cout << BOLD << "[2]" << RESET << " Change Weather\n";
+        std::cout << BOLD << "[3]" << RESET << " Auto-tune Weather Offset\n";
         std::cout << BOLD << "[0]" << RESET << " Exit\n";
         std::cout << "\n" << CYAN << "=> " << RESET;
 
@@ -410,6 +479,53 @@ int main(int, char**) {
                 std::cin >> id;
 
                 weatherMgr.applyWeather(mem, id);
+
+                std::cout << "\nPress Enter to return...";
+                std::cin.ignore();
+                std::cin.get();
+                break;
+            }
+            case 3: {
+                auto offsets = weatherMgr.trialOffsets();
+                if (offsets.empty()) {
+                    std::cout << RED << "[!] No candidate offsets near baseline to try." << RESET << "\n";
+                } else {
+                    constexpr int TEST_WEATHER = 1; // Snow — частицы снега видно на земле сразу
+                    std::cout << "\n" << BOLD << "Auto-tune offset" << RESET << "\n"
+                              << "Программа по очереди ставит ВИДНУЮ погоду (Snow) на каждый кандидат,\n"
+                              << "а ты смотришь в игру и отвечаешь y (да) / n (нет) / q (стоп).\n"
+                              << YELLOW << "Зайди в матч или демо, где видно небо/землю, потом начинай.\n" << RESET
+                              << "Кандидатов рядом с базой: " << offsets.size() << "\n";
+                    std::cout << "Нажми Enter чтобы начать...";
+                    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+
+                    bool found = false;
+                    for (const uint32_t off : offsets) {
+                        const int n = weatherMgr.applyAt(mem, off, TEST_WEATHER, true);
+                        std::cout << "\n[*] Offset 0x" << std::hex << off << std::dec
+                                  << " — патч в " << n << " местах.\n";
+                        std::cout << CYAN << "    Погода в игре ИЗМЕНИЛАСЬ? (y/n/q): " << RESET;
+                        std::string ans;
+                        std::cin >> ans;
+
+                        if (ans == "y" || ans == "Y") {
+                            weatherMgr.lock(off);
+                            std::cout << GREEN << "[+] Оффсет 0x" << std::hex << off << std::dec
+                                      << " зафиксирован! Теперь меняй погоду через [2]." << RESET << "\n";
+                            std::cout << YELLOW << "    Впиши HINT_OFFSET = 0x" << std::hex << off << std::dec
+                                      << " в исходник, чтобы в след. раз пробовался первым." << RESET << "\n";
+                            found = true;
+                            break;
+                        }
+
+                        weatherMgr.revert(mem); // не сработало — вернуть оригинальные байты
+                        if (ans == "q" || ans == "Q") break;
+                    }
+
+                    if (!found)
+                        std::cout << RED << "\n[!] Ни один близкий оффсет не сработал. "
+                                            "Увеличь TRIAL_WINDOW в исходнике или ищи в Binary Ninja." << RESET << "\n";
+                }
 
                 std::cout << "\nPress Enter to return...";
                 std::cin.ignore();
