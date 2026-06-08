@@ -208,17 +208,24 @@ class WeatherManager {
         size_t size;        // длина инструкции (сколько байт перезаписываем)
     };
 
-    // Снимок оригинальных байтов — чтобы откатить пробный патч.
-    struct SavedBytes {
+    // Место патча: адрес инструкции + её ОРИГИНАЛЬНЫЕ байты (чтобы вернуть как было).
+    struct PatchSite {
         uintptr_t address;
-        std::vector<uint8_t> bytes;
+        size_t size;
+        std::vector<uint8_t> original;
     };
 
     std::vector<Hit> allHits;          // все найденные чтения [RBX+small]
-    std::vector<SavedBytes> backup;    // оригиналы текущего НЕподтверждённого патча
+    std::vector<PatchSite> sites;      // подтверждённые места патча (+оригиналы)
+    std::vector<PatchSite> backup;     // оригиналы текущего НЕподтверждённого пробного патча
+    uintptr_t moduleBase = 0;          // база exec-региона libclient (ключ сессии)
     uint32_t resolvedOffset = 0;       // подтверждённый оффсет погоды
     bool isScanned = false;
-    bool locked = false;               // оффсет подтверждён сменой погоды в игре
+    bool locked = false;               // оффсет подтверждён/восстановлен
+
+    // Файл состояния: чтобы при перезапуске проги (та же сессия Dota) подхватить
+    // оффсет даже когда инструкции уже затёрты нашим патчем.
+    const std::string STATE_PATH = "/tmp/dota_weather_patch.state";
 
     // ─────────────────────────────────────────────────────────────────────────
     //  HINT_OFFSET — последний РАБОЧИЙ оффсет погоды. По одним байтам отличить
@@ -261,6 +268,57 @@ class WeatherManager {
         return out;
     }
 
+    // Прочитать текущие (оригинальные на момент скана) байты мест данного смещения.
+    std::vector<PatchSite> captureSites(const ProcessMemory& mem, uint32_t offset) const {
+        std::vector<PatchSite> out;
+        for (const Hit* h : hitsForOffset(offset)) {
+            PatchSite s{ h->address, h->size, {} };
+            if (mem.readBytes(h->address, h->size, s.original))
+                out.push_back(std::move(s));
+        }
+        return out;
+    }
+
+    void saveState() const {
+        std::ofstream f(STATE_PATH, std::ios::trunc);
+        if (!f) return;
+        f << "base " << std::hex << moduleBase << "\n";
+        f << "offset " << std::hex << resolvedOffset << "\n";
+        for (const auto& s : sites) {
+            f << "site " << std::hex << s.address << " " << std::dec << s.size << " ";
+            for (const uint8_t b : s.original)
+                f << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
+            f << "\n";
+        }
+    }
+
+    struct State {
+        bool valid = false;
+        uintptr_t base = 0;
+        uint32_t offset = 0;
+        std::vector<PatchSite> sites;
+    };
+
+    State loadState() const {
+        State st;
+        std::ifstream f(STATE_PATH);
+        if (!f) return st;
+        std::string tok;
+        while (f >> tok) {
+            if (tok == "base")        f >> std::hex >> st.base;
+            else if (tok == "offset") f >> std::hex >> st.offset;
+            else if (tok == "site") {
+                PatchSite s; std::string hex;
+                f >> std::hex >> s.address >> std::dec >> s.size >> hex;
+                for (size_t i = 0; i + 1 < hex.size(); i += 2)
+                    s.original.push_back(static_cast<uint8_t>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+                st.sites.push_back(std::move(s));
+            }
+        }
+        st.valid = (st.base != 0 && !st.sites.empty());
+        return st;
+    }
+
 public:
     uint32_t getOffset() const { return resolvedOffset; }
     bool hasCandidates() const { return !allHits.empty(); }
@@ -268,6 +326,8 @@ public:
 
     void scan(const ProcessMemory& mem, const std::vector<MemoryRegion>& regions) {
         if (isScanned) return;
+
+        if (!regions.empty()) moduleBase = regions.front().start;
 
         std::cout << YELLOW << "[*] Scanning weather instructions (baseline 0x"
                   << std::hex << HINT_OFFSET << std::dec << ")..." << RESET << "\n";
@@ -303,18 +363,34 @@ public:
             return;
         }
 
-        // Если известный рабочий оффсет на месте — сразу закрепляем его, чтобы в
-        // обычном случае погода работала без всякого тюна.
+        // Случай 1: сигнатуры целы (код не патчен) — известный оффсет на месте.
+        // Сохраняем оригинальные байты и сразу готовы к работе.
         if (!hitsForOffset(HINT_OFFSET).empty()) {
             resolvedOffset = HINT_OFFSET;
+            sites = captureSites(mem, HINT_OFFSET);
             locked = true;
+            saveState();
             std::cout << GREEN << "[+] Weather offset 0x" << std::hex << HINT_OFFSET << std::dec
                       << " is in place — ready to use." << RESET << "\n";
-        } else {
-            std::cout << YELLOW << "[!] Known offset 0x" << std::hex << HINT_OFFSET << std::dec
-                      << " not found — game was probably updated.\n"
-                      << "    Run [t] Recalibrate to find the new one." << RESET << "\n";
+            return;
         }
+
+        // Случай 2: сигнатур нет — код уже затёрт нашим патчем в этой же сессии Dota.
+        // Восстанавливаем оффсет из файла состояния (без рестарта игры).
+        const State st = loadState();
+        if (st.valid && st.base == moduleBase) {
+            resolvedOffset = st.offset;
+            sites = st.sites;
+            locked = true;
+            std::cout << GREEN << "[+] Recovered weather offset 0x" << std::hex << st.offset << std::dec
+                      << " from previous session — no Dota restart needed." << RESET << "\n";
+            return;
+        }
+
+        // Случай 3: ни сигнатур, ни валидного состояния — нужна рекалибровка.
+        std::cout << YELLOW << "[!] Known offset 0x" << std::hex << HINT_OFFSET << std::dec
+                  << " not found — game was probably updated.\n"
+                  << "    Run [t] Recalibrate to find the new one." << RESET << "\n";
     }
 
     // Уникальные смещения в окне вокруг HINT, отсортированные по близости к нему.
@@ -331,45 +407,58 @@ public:
         return offs;
     }
 
-    // Запатчить ВСЕ инструкции с данным смещением, предварительно сохранив оригиналы.
-    // Сколько мест записано — столько и возвращаем.
-    int applyAt(const ProcessMemory& mem, uint32_t offset, int weatherId, bool keepBackup) {
+    // Пробно запатчить все инструкции с данным смещением, сохранив оригиналы в backup.
+    int applyAt(const ProcessMemory& mem, uint32_t offset, int weatherId) {
         backup.clear();
         int count = 0;
         for (const Hit* h : hitsForOffset(offset)) {
-            std::vector<uint8_t> orig;
-            if (keepBackup && mem.readBytes(h->address, h->size, orig))
-                backup.push_back({ h->address, orig });
+            PatchSite s{ h->address, h->size, {} };
+            if (mem.readBytes(h->address, h->size, s.original))
+                backup.push_back(s);
             if (mem.writeBytes(h->address, makePatch(weatherId, h->size)))
                 count++;
         }
-        if (!keepBackup) backup.clear();
         return count;
     }
 
     // Вернуть оригинальные байты последнего пробного патча.
     void revert(const ProcessMemory& mem) {
         for (const auto& s : backup)
-            mem.writeBytes(s.address, s.bytes);
+            mem.writeBytes(s.address, s.original);
         backup.clear();
     }
 
-    // Зафиксировать найденный оффсет как рабочий.
+    // Зафиксировать найденный оффсет как рабочий: пробные оригиналы становятся
+    // постоянными местами патча, состояние пишется в файл.
     void lock(uint32_t offset) {
         resolvedOffset = offset;
         locked = true;
-        backup.clear(); // подтверждённый патч откатывать не нужно
+        sites = std::move(backup);
+        backup.clear();
+        saveState();
     }
 
-    // Обычная смена погоды по уже подтверждённому оффсету.
+    // Смена погоды по подтверждённому оффсету.
+    // id == 0 (Default) — ВОССТАНАВЛИВАЕМ оригинальный код, а не пишем ноль:
+    // погода становится по-настоящему дефолтной и сигнатура снова на месте.
     void applyWeather(const ProcessMemory& mem, int weatherId) {
-        if (!locked) {
-            std::cout << RED << "[!] Offset not confirmed yet. Run [3] Auto-tune first." << RESET << "\n";
+        if (!locked || sites.empty()) {
+            std::cout << RED << "[!] Offset not confirmed yet. Run [t] Recalibrate first." << RESET << "\n";
             return;
         }
-        const int count = applyAt(mem, resolvedOffset, weatherId, false);
-        std::cout << GREEN << "[+] Weather ID " << weatherId << " applied to " << count
-                  << " locations (offset 0x" << std::hex << resolvedOffset << std::dec << ")." << RESET << "\n";
+
+        int count = 0;
+        if (weatherId == 0) {
+            for (const auto& s : sites)
+                if (mem.writeBytes(s.address, s.original)) count++;
+            std::cout << GREEN << "[+] Default restored (original code) at " << count
+                      << " locations." << RESET << "\n";
+        } else {
+            for (const auto& s : sites)
+                if (mem.writeBytes(s.address, makePatch(weatherId, s.size))) count++;
+            std::cout << GREEN << "[+] Weather ID " << weatherId << " applied to " << count
+                      << " locations (offset 0x" << std::hex << resolvedOffset << std::dec << ")." << RESET << "\n";
+        }
         std::cout << BLUE << "(Move your camera or reconnect to see changes for Sky)" << RESET << "\n";
     }
 };
@@ -633,7 +722,7 @@ int main(int, char**) {
 
                     bool found = false;
                     for (const uint32_t off : offsets) {
-                        const int n = weatherMgr.applyAt(mem, off, TEST_WEATHER, true);
+                        const int n = weatherMgr.applyAt(mem, off, TEST_WEATHER);
                         std::cout << "\n[*] Offset 0x" << std::hex << off << std::dec
                                   << " — патч в " << n << " местах.\n";
                         std::cout << CYAN << "    Погода в игре ИЗМЕНИЛАСЬ? (y/n/q): " << RESET;
