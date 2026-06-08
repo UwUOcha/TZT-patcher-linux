@@ -22,6 +22,8 @@ const std::string BLUE    = "\033[34m";
 const std::string MAGENTA = "\033[35m";
 const std::string CYAN    = "\033[36m";
 const std::string BOLD    = "\033[1m";
+const std::string DIM     = "\033[2m";
+const std::string GRAY    = "\033[90m";
 
 void clearScreen() {
     std::cout << "\033[2J\033[1;1H";
@@ -220,7 +222,7 @@ class WeatherManager {
     //  ближайших к этому числу. Когда подтвердишь новый оффсет — впиши его сюда,
     //  чтобы в следующий раз перебор начинался прямо с него.
     // ─────────────────────────────────────────────────────────────────────────
-    static constexpr uint32_t HINT_OFFSET = 0xADC;
+    static constexpr uint32_t HINT_OFFSET = 0xAD4;
     static constexpr uint32_t MIN_OFFSET  = 0x100;  // нижняя граница разумного смещения
     static constexpr uint32_t MAX_OFFSET  = 0x4000; // верхняя граница разумного смещения
     static constexpr uint32_t TRIAL_WINDOW = 0x80;  // насколько далеко от HINT перебираем
@@ -291,11 +293,23 @@ public:
         }
 
         isScanned = true;
-        if (allHits.empty())
+        if (allHits.empty()) {
             std::cout << RED << "[!] No candidate instructions found. Game changed too much." << RESET << "\n";
-        else
-            std::cout << GREEN << "[+] Collected " << allHits.size()
-                      << " candidate reads. Use [3] to auto-tune the offset." << RESET << "\n";
+            return;
+        }
+
+        // Если известный рабочий оффсет на месте — сразу закрепляем его, чтобы в
+        // обычном случае погода работала без всякого тюна.
+        if (!hitsForOffset(HINT_OFFSET).empty()) {
+            resolvedOffset = HINT_OFFSET;
+            locked = true;
+            std::cout << GREEN << "[+] Weather offset 0x" << std::hex << HINT_OFFSET << std::dec
+                      << " is in place — ready to use." << RESET << "\n";
+        } else {
+            std::cout << YELLOW << "[!] Known offset 0x" << std::hex << HINT_OFFSET << std::dec
+                      << " not found — game was probably updated.\n"
+                      << "    Run [t] Recalibrate to find the new one." << RESET << "\n";
+        }
     }
 
     // Уникальные смещения в окне вокруг HINT, отсортированные по близости к нему.
@@ -414,30 +428,60 @@ int main(int, char**) {
     while (running) {
         printBanner();
 
-        std::cout << "Camera Status: " << (cameraAddr != 0 ? (GREEN + "LINKED") : (RED + "NOT LINKED")) << RESET;
-        if (cameraAddr != 0) std::cout << " (" << currentCamDist << ")";
-        std::cout << "\nWeather Status: ";
-        if (weatherMgr.isLocked())
-            std::cout << GREEN << "READY (offset 0x" << std::hex << weatherMgr.getOffset() << std::dec << ")" << RESET;
-        else if (weatherMgr.hasCandidates())
-            std::cout << YELLOW << "NEEDS TUNING (run [3])" << RESET;
-        else
-            std::cout << RED << "NOT FOUND" << RESET;
+        const bool weatherNeedsCalib = !weatherMgr.isLocked() && weatherMgr.hasCandidates();
+        const std::string divider = "  " + GRAY + "──────────────────────────────────────────────" + RESET + "\n";
+
+        // ── Статус ──
+        std::cout << "  " << (cameraAddr != 0 ? GREEN : RED) << "●" << RESET
+                  << " Camera   " << GRAY << ":" << RESET << " ";
+        if (cameraAddr != 0) std::cout << GREEN << "linked" << RESET << GRAY << "  " << currentCamDist << RESET;
+        else                 std::cout << GRAY << "not linked" << RESET;
         std::cout << "\n";
-        std::cout << "------------------------------------------------------\n";
 
-        std::cout << BOLD << "[1]" << RESET << " Setup Camera Distance\n";
-        std::cout << BOLD << "[2]" << RESET << " Change Weather\n";
-        std::cout << BOLD << "[3]" << RESET << " Auto-tune Weather Offset\n";
-        std::cout << BOLD << "[0]" << RESET << " Exit\n";
-        std::cout << "\n" << CYAN << "=> " << RESET;
+        std::cout << "  ";
+        if (weatherMgr.isLocked())
+            std::cout << GREEN << "●" << RESET << " Weather  " << GRAY << ":" << RESET << " "
+                      << GREEN << "ready" << RESET << GRAY << "  offset 0x"
+                      << std::hex << weatherMgr.getOffset() << std::dec << RESET;
+        else if (weatherMgr.hasCandidates())
+            std::cout << YELLOW << "●" << RESET << " Weather  " << GRAY << ":" << RESET << " "
+                      << YELLOW << "needs calibration" << RESET;
+        else
+            std::cout << RED << "●" << RESET << " Weather  " << GRAY << ":" << RESET << " "
+                      << RED << "not found" << RESET;
+        std::cout << "\n\n";
 
-        int choice;
-        if (!(std::cin >> choice)) {
+        // ── Главные действия ──
+        std::cout << divider;
+        std::cout << "   " << BOLD << CYAN << "[1]" << RESET << "  Camera distance\n";
+        std::cout << "   " << BOLD << CYAN << "[2]" << RESET << "  Change weather\n";
+        std::cout << "\n";
+
+        // ── Второстепенная строка: тюн (подсвечен только если нужен) и выход ──
+        std::cout << "   ";
+        if (weatherNeedsCalib)
+            std::cout << BOLD << YELLOW << "[t]" << RESET << YELLOW << " Recalibrate weather" << RESET
+                      << YELLOW << "  ← сделай это сначала" << RESET;
+        else
+            std::cout << GRAY << "[t] recalibrate weather" << RESET;
+        std::cout << GRAY << "   ·   [0] exit" << RESET << "\n";
+        std::cout << divider;
+        std::cout << "\n   " << CYAN << "❯ " << RESET;
+
+        // Команды — строкой, чтобы принимать и цифры, и букву 't'.
+        std::string cmd;
+        if (!(std::cin >> cmd)) {
             std::cin.clear();
             std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
             continue;
         }
+
+        int choice;
+        if (cmd == "t" || cmd == "T")      choice = 3;
+        else if (cmd == "0")               choice = 0;
+        else if (cmd == "1")               choice = 1;
+        else if (cmd == "2")               choice = 2;
+        else                               continue; // неизвестная команда — перерисовать меню
 
         switch (choice) {
             case 0: {
