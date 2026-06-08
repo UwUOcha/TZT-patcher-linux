@@ -24,6 +24,11 @@ const std::string CYAN    = "\033[36m";
 const std::string BOLD    = "\033[1m";
 const std::string DIM     = "\033[2m";
 const std::string GRAY    = "\033[90m";
+// 256-цветные оттенки для иконок погоды
+const std::string WHITE   = "\033[97m";
+const std::string ORANGE  = "\033[38;5;208m";
+const std::string PURPLE  = "\033[38;5;141m";
+const std::string PINK    = "\033[38;5;213m";
 
 void clearScreen() {
     std::cout << "\033[2J\033[1;1H";
@@ -370,12 +375,38 @@ public:
 };
 
 void printWeatherList() {
-    std::cout << "\n" << BOLD << "Available Weather IDs:" << RESET << "\n";
-    std::cout << std::left << std::setw(20) << "1  - Snow" << std::setw(20) << "2  - Rain" << "\n";
-    std::cout << std::left << std::setw(20) << "3  - Moonbeam" << std::setw(20) << "4  - Pestilence" << "\n";
-    std::cout << std::left << std::setw(20) << "5  - Harvest" << std::setw(20) << "6  - Sirocco" << "\n";
-    std::cout << std::left << std::setw(20) << "7  - Spring" << std::setw(20) << "8  - Ash" << "\n";
-    std::cout << std::left << std::setw(20) << "9  - Aurora" << std::setw(20) << "0  - Default" << "\n";
+    struct WeatherItem {
+        std::string color;
+        std::string icon; // глиф Nerd Font
+        char key;
+        std::string name;
+    };
+
+    // Иконки заданы кодпоинтами (\u / \U), чтобы не зависеть от вставки глифа.
+    static const std::vector<WeatherItem> items = {
+        { WHITE,  "\uF2DC",     '1', "Snow"       },
+        { BLUE,   "\uE318",     '2', "Rain"       },
+        { PURPLE, "\uF4EE",     '3', "Moonbeam"   },
+        { GREEN,  "\uF043",     '4', "Pestilence" },
+        { ORANGE, "\U000F0E69", '5', "Harvest"    },
+        { YELLOW, "\uE37A",     '6', "Sirocco"    },
+        { PINK,   "\U000F09F2", '7', "Spring"     },
+        { RED,    "\uEF2E",     '8', "Ash"        },
+        { CYAN,   "\U000F078D", '9', "Aurora"     },
+        { GRAY,   "•",     '0', "Default"    },
+    };
+
+    std::cout << "\n" << BOLD << "Weather:" << RESET << "\n";
+    for (size_t i = 0; i < items.size(); i += 2) {
+        for (size_t j = i; j < i + 2 && j < items.size(); ++j) {
+            const auto& w = items[j];
+            const std::string label = std::string("[") + w.key + "] " + w.name; // видимая ASCII-часть
+            std::cout << "   " << w.color << w.icon << RESET << "  " << label;
+            for (int pad = static_cast<int>(label.size()); pad < 16; ++pad)
+                std::cout << ' ';
+        }
+        std::cout << "\n";
+    }
 }
 
 int main(int, char**) {
