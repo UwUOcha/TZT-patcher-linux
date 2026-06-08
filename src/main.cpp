@@ -139,11 +139,10 @@ std::vector<int> parsePattern(const std::string& pattern) {
     return bytes;
 }
 
-std::vector<uintptr_t> findAllPatterns(const ProcessMemory& mem, const MemoryRegion& region, const std::string& patternStr) {
-    if (region.perms.find('x') == std::string::npos)
+std::vector<uintptr_t> findAllPatterns(const ProcessMemory& mem, const MemoryRegion& region, const std::vector<int>& pattern) {
+    if (region.perms.find('x') == std::string::npos || pattern.empty())
         return {};
 
-    const auto pattern = parsePattern(patternStr);
     constexpr size_t CHUNK_SIZE = 0x100000; // 1MB chunks
 
     std::vector<uint8_t> buffer;
@@ -151,9 +150,12 @@ std::vector<uintptr_t> findAllPatterns(const ProcessMemory& mem, const MemoryReg
 
     for (uintptr_t addr = region.start; addr < region.end; addr += CHUNK_SIZE) {
         const size_t readSize = std::min(CHUNK_SIZE, static_cast<size_t>(region.end - addr));
+        if (readSize < pattern.size()) continue;
         if (!mem.readBytes(addr, readSize, buffer)) continue;
 
-        for (size_t i = 0; i <= readSize - pattern.size(); ++i) {
+        // `i + pattern.size() <= readSize` avoids the size_t underflow that the
+        // old `i <= readSize - pattern.size()` had on short region tails.
+        for (size_t i = 0; i + pattern.size() <= readSize; ++i) {
             bool found = true;
             for (size_t j = 0; j < pattern.size(); ++j) {
                 if (pattern[j] != -1 && buffer[i + j] != static_cast<uint8_t>(pattern[j])) {
@@ -199,29 +201,51 @@ class WeatherManager {
     std::vector<CachedPatchLocation> locations;
     bool isScanned = false;
 
+    // ─────────────────────────────────────────────────────────────────────────
+    //  ОФФСЕТ ПОЛЯ ПОГОДЫ В КЛАССЕ.
+    //  Это смещение поля "тип погоды" внутри игрового объекта (RBX = указатель
+    //  на объект). В дизассемблере оно выглядит как [RBX+0xADC].
+    //  Когда выходит патч Dota и смена погоды ломается — нужно найти новое
+    //  значение в Binary Ninja и поменять ТОЛЬКО эту одну строку, затем
+    //  пересобрать программу (make).
+    // ─────────────────────────────────────────────────────────────────────────
+    static constexpr uint32_t WEATHER_OFFSET = 0xADC;
+
     struct PatternDef {
         std::string name;
-        std::string signature;
+        std::string opcodePrefix; // байты инструкции ДО 32-битного смещения
     };
 
     const std::vector<PatternDef> PATTERNS = {
-        { "Particles", "48 63 83 DC 0A 00 00" }, // MOVSXD RAX, [RBX+0xADC]
-        { "Lighting",  "8B 83 DC 0A 00 00"    }  // MOV EAX, [RBX+0xADC]
+        { "Particles", "48 63 83" }, // MOVSXD RAX, [RBX+WEATHER_OFFSET]
+        { "Lighting",  "8B 83"    }  // MOV   EAX, [RBX+WEATHER_OFFSET]
     };
+
+    // Склеивает префикс опкода с 4 байтами смещения (little-endian).
+    static std::vector<int> buildSignature(const std::string& opcodePrefix) {
+        std::vector<int> sig = parsePattern(opcodePrefix);
+        for (int i = 0; i < 4; ++i)
+            sig.push_back(static_cast<int>((WEATHER_OFFSET >> (i * 8)) & 0xFF));
+        return sig;
+    }
 
 public:
     void scan(const ProcessMemory& mem, const std::vector<MemoryRegion>& regions) {
         if (isScanned) return;
 
-        std::cout << YELLOW << "[*] Scanning memory for weather signatures..." << RESET << "\n";
+        std::cout << YELLOW << "[*] Scanning memory for weather signatures (offset 0x"
+                  << std::hex << WEATHER_OFFSET << std::dec << ")..." << RESET << "\n";
+
+        // Сигнатуры собираем один раз, а не на каждом регионе.
+        std::vector<std::pair<std::string, std::vector<int>>> signatures;
+        for (const auto& pat : PATTERNS)
+            signatures.emplace_back(pat.name, buildSignature(pat.opcodePrefix));
 
         for (const auto& region : regions) {
-            for (const auto& pat : PATTERNS) {
-                auto foundAddrs = findAllPatterns(mem, region, pat.signature);
-                const size_t sigSize = parsePattern(pat.signature).size();
-
+            for (const auto& [name, signature] : signatures) {
+                auto foundAddrs = findAllPatterns(mem, region, signature);
                 for (const auto addr : foundAddrs) {
-                    locations.push_back({ addr, sigSize, pat.name });
+                    locations.push_back({ addr, signature.size(), name });
                 }
             }
         }
