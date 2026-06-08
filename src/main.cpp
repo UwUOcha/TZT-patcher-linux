@@ -223,6 +223,11 @@ class WeatherManager {
     bool isScanned = false;
     bool locked = false;               // оффсет подтверждён/восстановлен
 
+    // Адрес дистанции камеры — тоже хранится в общем файле состояния, чтобы после
+    // перезапуска проги (та же сессия Dota) сразу менять даже изменённую дистанцию.
+    uintptr_t persistedCamera = 0;     // что писать в файл (0 = нет)
+    uintptr_t loadedCamera = 0;        // что подхватили из файла этой сессии (0 = нет)
+
     // Файл состояния: чтобы при перезапуске проги (та же сессия Dota) подхватить
     // оффсет даже когда инструкции уже затёрты нашим патчем.
     const std::string STATE_PATH = "/tmp/dota_weather_patch.state";
@@ -284,6 +289,7 @@ class WeatherManager {
         if (!f) return;
         f << "base " << std::hex << moduleBase << "\n";
         f << "offset " << std::hex << resolvedOffset << "\n";
+        f << "camera " << std::hex << persistedCamera << "\n";
         for (const auto& s : sites) {
             f << "site " << std::hex << s.address << " " << std::dec << s.size << " ";
             for (const uint8_t b : s.original)
@@ -293,9 +299,10 @@ class WeatherManager {
     }
 
     struct State {
-        bool valid = false;
+        bool valid = false;        // есть валидные данные погоды (база + места патча)
         uintptr_t base = 0;
         uint32_t offset = 0;
+        uintptr_t cameraAddr = 0;
         std::vector<PatchSite> sites;
     };
 
@@ -307,6 +314,7 @@ class WeatherManager {
         while (f >> tok) {
             if (tok == "base")        f >> std::hex >> st.base;
             else if (tok == "offset") f >> std::hex >> st.offset;
+            else if (tok == "camera") f >> std::hex >> st.cameraAddr;
             else if (tok == "site") {
                 PatchSite s; std::string hex;
                 f >> std::hex >> s.address >> std::dec >> s.size >> hex;
@@ -320,6 +328,15 @@ class WeatherManager {
     }
 
 public:
+    // Адрес камеры, подхваченный из файла этой же сессии (0 = нечего восстанавливать).
+    uintptr_t recoveredCameraAddr() const { return loadedCamera; }
+
+    // Запомнить адрес камеры и переписать файл состояния (вместе с данными погоды).
+    void persistCamera(uintptr_t addr) {
+        persistedCamera = addr;
+        saveState();
+    }
+
     uint32_t getOffset() const { return resolvedOffset; }
     bool hasCandidates() const { return !allHits.empty(); }
     bool isLocked() const { return locked; }
@@ -358,6 +375,15 @@ public:
         }
 
         isScanned = true;
+
+        // Файл состояния читаем один раз — он нужен и для камеры, и для погоды.
+        const State st = loadState();
+        const bool sameSession = (st.base != 0 && st.base == moduleBase);
+        if (sameSession) {
+            persistedCamera = st.cameraAddr; // не потерять при последующих перезаписях файла
+            loadedCamera    = st.cameraAddr; // отдать main для восстановления камеры
+        }
+
         if (allHits.empty()) {
             std::cout << RED << "[!] No candidate instructions found. Game changed too much." << RESET << "\n";
             return;
@@ -377,8 +403,7 @@ public:
 
         // Случай 2: сигнатур нет — код уже затёрт нашим патчем в этой же сессии Dota.
         // Восстанавливаем оффсет из файла состояния (без рестарта игры).
-        const State st = loadState();
-        if (st.valid && st.base == moduleBase) {
+        if (st.valid && sameSession) {
             resolvedOffset = st.offset;
             sites = st.sites;
             locked = true;
@@ -549,7 +574,10 @@ int main(int, char**) {
             cameraAddr = scanForCameraAddress(mem, region, dist);
             if (cameraAddr != 0) break;
         }
-        if (cameraAddr != 0) currentCamDist = dist;
+        if (cameraAddr != 0) {
+            currentCamDist = dist;
+            weatherMgr.persistCamera(cameraAddr); // запомнить адрес на будущие запуски
+        }
         return cameraAddr != 0;
     };
 
@@ -574,6 +602,19 @@ int main(int, char**) {
     };
 
     weatherMgr.scan(mem, clientRegions);
+
+    // Восстановление дистанции камеры из прошлого запуска (та же сессия Dota):
+    // если сохранённый адрес ещё жив и хранит правдоподобную дистанцию — цепляемся
+    // сразу, чтобы [1] менял даже уже изменённую дистанцию без релинка.
+    if (const uintptr_t rc = weatherMgr.recoveredCameraAddr()) {
+        float dist = 0.0f;
+        if (mem.read(rc, dist) && dist > 100.0f && dist < 10000.0f) {
+            cameraAddr = rc;
+            currentCamDist = dist;
+            std::cout << GREEN << "[+] Camera linked from previous session — distance "
+                      << dist << "." << RESET << "\n";
+        }
+    }
 
     std::cout << "\nPress Enter to continue...";
     std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
