@@ -415,10 +415,43 @@ int main(int, char**) {
 
     std::cout << "[*] Found " << clientRegions.size() << " executable regions.\n";
 
+    constexpr float DEFAULT_CAM_DISTANCE = 1200.0f; // дефолтная дистанция камеры в Dota
+
     WeatherManager weatherMgr;
     uintptr_t cameraAddr = 0;
     bool running = true;
-    float currentCamDist = 1200.0f;
+    float currentCamDist = DEFAULT_CAM_DISTANCE;
+
+    // Привязать камеру: найти в памяти float рядом с указанной дистанцией.
+    auto linkCameraAt = [&](float dist) -> bool {
+        cameraAddr = 0;
+        for (const auto& region : dataRegions) {
+            cameraAddr = scanForCameraAddress(mem, region, dist);
+            if (cameraAddr != 0) break;
+        }
+        if (cameraAddr != 0) currentCamDist = dist;
+        return cameraAddr != 0;
+    };
+
+    // Спросить желаемую дистанцию и записать её (камера уже должна быть привязана).
+    auto promptAndSetDistance = [&]() {
+        std::cout << "Enter desired distance (e.g. 1400, 1350): " << CYAN;
+        float val;
+        const bool ok = static_cast<bool>(std::cin >> val);
+        std::cout << RESET;
+        if (!ok) {
+            std::cin.clear();
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            std::cout << RED << "Bad input." << RESET << "\n";
+            return;
+        }
+        if (mem.write(cameraAddr, val)) {
+            currentCamDist = val;
+            std::cout << GREEN << "[+] Done! Camera distance = " << val << RESET << "\n";
+        } else {
+            std::cout << RED << "Write failed." << RESET << "\n";
+        }
+    };
 
     weatherMgr.scan(mem, clientRegions);
 
@@ -457,7 +490,8 @@ int main(int, char**) {
         std::cout << "   " << BOLD << CYAN << "[2]" << RESET << "  Change weather\n";
         std::cout << "\n";
 
-        // ── Второстепенная строка: тюн (подсвечен только если нужен) и выход ──
+        // ── Второстепенные сервисные действия ──
+        std::cout << "   " << GRAY << "[c] relink camera (if already zoomed)" << RESET << "\n";
         std::cout << "   ";
         if (weatherNeedsCalib)
             std::cout << BOLD << YELLOW << "[t]" << RESET << YELLOW << " Recalibrate weather" << RESET
@@ -468,7 +502,7 @@ int main(int, char**) {
         std::cout << divider;
         std::cout << "\n   " << CYAN << "❯ " << RESET;
 
-        // Команды — строкой, чтобы принимать и цифры, и букву 't'.
+        // Команды — строкой, чтобы принимать и цифры, и буквы 't'/'c'.
         std::string cmd;
         if (!(std::cin >> cmd)) {
             std::cin.clear();
@@ -478,6 +512,7 @@ int main(int, char**) {
 
         int choice;
         if (cmd == "t" || cmd == "T")      choice = 3;
+        else if (cmd == "c" || cmd == "C") choice = 4;
         else if (cmd == "0")               choice = 0;
         else if (cmd == "1")               choice = 1;
         else if (cmd == "2")               choice = 2;
@@ -489,31 +524,53 @@ int main(int, char**) {
                 break;
             }
             case 1: {
+                // Авто-подхват: если камера ещё не привязана, считаем, что она на
+                // дефолте, и цепляемся без лишних вопросов.
                 if (cameraAddr == 0) {
-                    std::cout << "\nEnter current in-game distance (default 1200 or 1134): ";
-                    float scanVal;
-                    std::cin >> scanVal;
-                    std::cout << YELLOW << "Scanning..." << RESET << "\n";
-                    for (const auto& region : dataRegions) {
-                        cameraAddr = scanForCameraAddress(mem, region, scanVal);
-                        if (cameraAddr != 0) break;
-                    }
+                    std::cout << YELLOW << "Linking camera (default " << DEFAULT_CAM_DISTANCE
+                              << ")..." << RESET << "\n";
+                    linkCameraAt(DEFAULT_CAM_DISTANCE);
                 }
 
                 if (cameraAddr != 0) {
-                    std::cout << GREEN << "[+] Found Camera at 0x" << std::hex << cameraAddr << std::dec << RESET << "\n";
-                    std::cout << "Enter new distance (e.g., 1400, 1350): ";
-                    float val;
-                    std::cin >> val;
-                    if (mem.write(cameraAddr, val)) {
-                        currentCamDist = val;
-                        std::cout << GREEN << "Done!" << RESET << "\n";
-                    } else {
-                        std::cout << RED << "Write failed." << RESET << "\n";
-                    }
+                    promptAndSetDistance();
                 } else {
-                    std::cout << RED << "[-] Camera entity not found. Try moving camera ingame." << RESET << "\n";
+                    std::cout << RED << "[-] Camera not at default " << DEFAULT_CAM_DISTANCE
+                              << ".\n    Если она уже отдалена — нажми [c] и введи её текущую дистанцию."
+                              << RESET << "\n";
                 }
+
+                std::cout << "\nPress Enter to return...";
+                std::cin.ignore();
+                std::cin.get();
+                break;
+            }
+            case 4: {
+                // Релинк по текущей дистанции — для случая, когда камера уже была
+                // отдалена, а программу перезапустили (дефолт 1200 уже не найдётся).
+                std::cout << "\nВведи ТЕКУЩУЮ дистанцию камеры (что стоит сейчас в игре): " << CYAN;
+                float scanVal;
+                const bool ok = static_cast<bool>(std::cin >> scanVal);
+                std::cout << RESET;
+                if (!ok) {
+                    std::cin.clear();
+                    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                    std::cout << RED << "Bad input." << RESET << "\n";
+                } else {
+                    std::cout << YELLOW << "Scanning for " << scanVal << "..." << RESET << "\n";
+                    if (linkCameraAt(scanVal)) {
+                        std::cout << GREEN << "[+] Camera linked at 0x" << std::hex << cameraAddr
+                                  << std::dec << RESET << "\n";
+                        promptAndSetDistance();
+                    } else {
+                        std::cout << RED << "[-] Не найдено. Подвигай камеру в игре и введи точное значение."
+                                  << RESET << "\n";
+                    }
+                }
+
+                std::cout << "\nPress Enter to return...";
+                std::cin.ignore();
+                std::cin.get();
                 break;
             }
             case 2: {
