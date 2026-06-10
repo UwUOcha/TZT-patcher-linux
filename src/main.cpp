@@ -488,6 +488,167 @@ public:
     }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  ParticlesManager — раскрытие партиклов в тумане войны (libclient.so).
+//
+//  Клиент каждый кадр (CDOTA_ParticleManager-cull) для каждого эффекта спрашивает
+//  «видна ли точка в FoW» и по ответу зовёт SetRenderingEnabled. Сам FoW-запрос —
+//  две функции-хелпера в libclient.so:
+//      IsPointVisible(x,y,z) -> bool     — для крупных эффектов (несколько точек)
+//      box-visibility(&p1,&p2) -> bool   — для мелких эффектов (радиус ≤ 1024)
+//  Обе несут хеш-id (mov edx, 0x6b4ed927) и зовут общий CFoW-резолвер — это делает
+//  их прологи уникальными. Форсим ОБЕ вернуть true (mov eax,1; ret) → каждая точка
+//  «видима» → эффект рендерится всегда, в т.ч. сквозь туман.
+//
+//  Подтверждено вживую: вражеские спелл-партиклы видны сквозь FoW. Адреса берём
+//  сигнатурным сканом по libclient.so; состояние переживает рестарт тулзы в той
+//  же сессии Доты.
+// ─────────────────────────────────────────────────────────────────────────────
+class ParticlesManager {
+    // Один патч-сайт: точка входа функции-хелпера + её оригинальные байты.
+    struct Site {
+        uintptr_t addr = 0;
+        std::vector<uint8_t> original;
+    };
+
+    std::vector<Site> sites;     // оба FoW-хелпера видимости
+    bool scanned = false;
+    uintptr_t moduleBase = 0;
+
+    // Файл состояния: подхватить сайты после рестарта тулзы в той же сессии Доты
+    // (когда код уже затёрт патчем и сигнатуры не находятся).
+    const std::string STATE_PATH = "/tmp/dota_particles_patch.state";
+
+    // mov eax, 1 ; ret — хелпер всегда возвращает «видно».
+    static const std::vector<uint8_t>& patchBytes() {
+        static const std::vector<uint8_t> p = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
+        return p;
+    }
+
+    // Прологи двух хелперов видимости. Обе несут `mov edx, 0x6b4ed927`
+    // (BA 27 D9 4E 6B) — id для общего CFoW-резолвера; вместе с порядком пушей
+    // это делает сигнатуры уникальными в libclient.so.
+    static const std::vector<std::string>& signatures() {
+        static const std::vector<std::string> s = {
+            // IsPointVisible(x@xmm0, y@xmm1, z@xmm2) -> bool
+            "55 31 C9 31 F6 BA 27 D9 4E 6B 48 89 E5 53 48 89 FB",
+            // box-visibility(&p1, &p2) -> bool
+            "55 31 C9 48 89 E5 41 55 49 89 D5 BA 27 D9 4E 6B 41 54 49 89 F4",
+        };
+        return s;
+    }
+
+    void saveState() const {
+        if (sites.size() != signatures().size()) return;
+        std::ofstream f(STATE_PATH, std::ios::trunc);
+        if (!f) return;
+        f << "base " << std::hex << moduleBase << "\n";
+        for (const auto& s : sites) {
+            f << "site " << std::hex << s.addr << " ";
+            for (const uint8_t b : s.original)
+                f << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
+            f << "\n";
+        }
+    }
+
+    struct State { bool valid = false; uintptr_t base = 0; std::vector<Site> sites; };
+
+    State loadState() const {
+        State st;
+        std::ifstream f(STATE_PATH);
+        if (!f) return st;
+        std::string tok;
+        while (f >> tok) {
+            if (tok == "base") f >> std::hex >> st.base;
+            else if (tok == "site") {
+                Site s; std::string hex;
+                f >> std::hex >> s.addr >> hex;
+                for (size_t i = 0; i + 1 < hex.size(); i += 2)
+                    s.original.push_back(static_cast<uint8_t>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+                st.sites.push_back(std::move(s));
+            }
+        }
+        st.valid = (st.base != 0 && st.sites.size() == signatures().size());
+        return st;
+    }
+
+public:
+    bool isFound() const { return sites.size() == signatures().size(); }
+    bool isCalibrated() const { return isFound(); } // отдельная калибровка не нужна
+    size_t siteCount() const { return sites.size(); }
+
+    // Патч включён, если на первом сайте стоит наш `mov eax,1` (0xB8).
+    bool isEnabled(const ProcessMemory& mem) const {
+        if (!isFound()) return false;
+        std::vector<uint8_t> buf;
+        return mem.readBytes(sites.front().addr, 1, buf) && buf[0] == 0xB8;
+    }
+
+    void scan(const ProcessMemory& mem, const std::vector<MemoryRegion>& regions) {
+        if (scanned) return;
+        scanned = true;
+        if (!regions.empty()) moduleBase = regions.front().start;
+
+        // Та же сессия Доты → подхватить сайты из файла (код мог быть уже патчен).
+        const State st = loadState();
+        if (st.valid && st.base == moduleBase) {
+            sites = st.sites;
+            std::cout << GREEN << "[+] Particles FoW gates recovered from state ("
+                      << sites.size() << " sites)." << RESET << "\n";
+            return;
+        }
+
+        for (const auto& sigStr : signatures()) {
+            const std::vector<int> sig = parsePattern(sigStr);
+            uintptr_t found = 0;
+            for (const auto& region : regions) {
+                const auto hits = findAllPatterns(mem, region, sig);
+                if (!hits.empty()) { found = hits.front(); break; }
+            }
+            if (!found) continue;
+            Site s{ found, {} };
+            if (mem.readBytes(found, patchBytes().size(), s.original))
+                sites.push_back(std::move(s));
+        }
+
+        if (isFound()) {
+            saveState();
+            std::cout << CYAN << "[*] Particles: both FoW gates located — [p] to reveal fog particles."
+                      << RESET << "\n";
+        } else if (sites.empty()) {
+            std::cout << YELLOW << "[!] Particle FoW gates not found "
+                      << "(game updated? refresh signatures from Binary Ninja)." << RESET << "\n";
+        } else {
+            // Нужны ОБА хелпера: мелкие эффекты идут через box-visibility, крупные —
+            // через IsPointVisible. С одним патч не вскроет всё, поэтому отключаем.
+            sites.clear();
+            std::cout << YELLOW << "[!] Only one particle gate found — need both, patch disabled."
+                      << RESET << "\n";
+        }
+    }
+
+    // Вкл/выкл: пропатчить ОБА хелпера на «всегда видно» / вернуть оригиналы.
+    void toggle(const ProcessMemory& mem) {
+        if (!isFound()) {
+            std::cout << RED << "[!] Particle gates not located. Game may have updated." << RESET << "\n";
+            return;
+        }
+        if (isEnabled(mem)) {
+            int n = 0;
+            for (const auto& s : sites)
+                if (mem.writeBytes(s.addr, s.original)) n++;
+            std::cout << YELLOW << "[-] Particles fog-reveal OFF (restored " << n
+                      << " sites)." << RESET << "\n";
+        } else {
+            int n = 0;
+            for (const auto& s : sites)
+                if (mem.writeBytes(s.addr, patchBytes())) n++;
+            std::cout << GREEN << "[+] Particles fog-reveal ON — enemy particles show through fog ("
+                      << n << " sites)!" << RESET << "\n";
+        }
+    }
+};
+
 void printWeatherList() {
     struct WeatherItem {
         std::string color;
@@ -563,6 +724,7 @@ int main(int, char**) {
     constexpr float DEFAULT_CAM_DISTANCE = 1200.0f; // дефолтная дистанция камеры в Dota
 
     WeatherManager weatherMgr;
+    ParticlesManager particlesMgr;
     uintptr_t cameraAddr = 0;
     bool running = true;
     float currentCamDist = DEFAULT_CAM_DISTANCE;
@@ -602,6 +764,7 @@ int main(int, char**) {
     };
 
     weatherMgr.scan(mem, clientRegions);
+    particlesMgr.scan(mem, clientRegions);
 
     // Восстановление дистанции камеры из прошлого запуска (та же сессия Dota):
     // если сохранённый адрес ещё жив и хранит правдоподобную дистанцию — цепляемся
@@ -643,12 +806,30 @@ int main(int, char**) {
         else
             std::cout << RED << "●" << RESET << " Weather  " << GRAY << ":" << RESET << " "
                       << RED << "not found" << RESET;
+        std::cout << "\n";
+
+        std::cout << "  ";
+        if (!particlesMgr.isFound())
+            std::cout << RED << "●" << RESET << " Particles" << GRAY << ":" << RESET << " "
+                      << RED << "not found" << RESET;
+        else if (particlesMgr.isEnabled(mem))
+            std::cout << GREEN << "●" << RESET << " Particles" << GRAY << ":" << RESET << " "
+                      << GREEN << "fog reveal ON" << RESET;
+        else
+            std::cout << YELLOW << "●" << RESET << " Particles" << GRAY << ":" << RESET << " "
+                      << GRAY << "default" << RESET;
         std::cout << "\n\n";
 
         // ── Главные действия ──
         std::cout << divider;
         std::cout << "   " << BOLD << CYAN << "[1]" << RESET << "  Camera distance\n";
         std::cout << "   " << BOLD << CYAN << "[2]" << RESET << "  Change weather\n";
+        std::cout << "   ";
+        if (particlesMgr.isFound())
+            std::cout << BOLD << CYAN << "[3]" << RESET << "  Particles fog-reveal "
+                      << GRAY << "(toggle)" << RESET << "\n";
+        else
+            std::cout << GRAY << "[3]  Particles fog-reveal (gates not found)" << RESET << "\n";
         std::cout << "\n";
 
         // ── Второстепенные сервисные действия ──
@@ -677,6 +858,7 @@ int main(int, char**) {
         else if (cmd == "0")               choice = 0;
         else if (cmd == "1")               choice = 1;
         else if (cmd == "2")               choice = 2;
+        else if (cmd == "3")               choice = 5; // частицы — основное действие
         else                               continue; // неизвестная команда — перерисовать меню
 
         switch (choice) {
@@ -788,6 +970,14 @@ int main(int, char**) {
                         std::cout << RED << "\n[!] Ни один близкий оффсет не сработал. "
                                             "Увеличь TRIAL_WINDOW в исходнике или ищи в Binary Ninja." << RESET << "\n";
                 }
+
+                std::cout << "\nPress Enter to return...";
+                std::cin.ignore();
+                std::cin.get();
+                break;
+            }
+            case 5: {
+                particlesMgr.toggle(mem);
 
                 std::cout << "\nPress Enter to return...";
                 std::cin.ignore();
