@@ -1,7 +1,7 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2
 TARGET = camera_patcher
-SRC = src/main.cpp
+SRC = $(wildcard src/*.cpp)
 BUILDDIR = build
 BINTARGET = $(BUILDDIR)/$(TARGET)
 FIX = $(BUILDDIR)/fix_ptrace.sh
