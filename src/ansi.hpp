@@ -32,7 +32,7 @@ inline void printBanner() {
     clearScreen();
     std::cout << CYAN << BOLD
               << "╔════════════════════════════════════════════════════╗\n"
-              << "║              EXTERNAL PATCHER (LINUX)              ║\n"
+              << "║                   TZT Patcher                      ║\n"
               << "║        " << RESET << "Camera Distance & Weather Changer  " << CYAN << BOLD << "         ║\n"
               << "╚════════════════════════════════════════════════════╝" << RESET << "\n\n";
 }

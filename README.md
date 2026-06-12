@@ -1,4 +1,4 @@
-# Camera patcher for linux
+# TZT Patcher
 **Use at your own risk**.
 Utility for changing the camera distance on linux.
 

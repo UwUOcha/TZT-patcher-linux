@@ -1,6 +1,6 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2
-TARGET = camera_patcher
+TARGET = tzt_patcher
 SRC = $(wildcard src/*.cpp)
 BUILDDIR = build
 BINTARGET = $(BUILDDIR)/$(TARGET)
