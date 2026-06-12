@@ -16,9 +16,9 @@ $(BINTARGET): $(SRC) | $(BUILDDIR)
 	@echo ""
 	@echo "✅ Compilation successful!"
 	@echo ""
-	@echo "Before running, fix ptrace_scope:"
-	@echo "  ./$(FIX)"
-	@echo ""
+#	@echo "Before running, fix ptrace_scope:"
+#	@echo "  ./$(FIX)"
+#	@echo ""
 	@echo "Then run:"
 	@echo "  sudo ./$(BINTARGET)"
 
