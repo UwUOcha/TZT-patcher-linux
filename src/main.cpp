@@ -9,10 +9,17 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <csignal>
+#include <cstdlib>
+#include <pwd.h>
+#include <grp.h>
 #include <limits>
 #include <algorithm>
 #include <sstream>
 #include <map>
+#include <chrono>
+#include <thread>
 
 const std::string RESET   = "\033[0m";
 const std::string RED     = "\033[31m";
@@ -67,6 +74,15 @@ public:
         memFd = open(memPath.c_str(), O_RDWR);
         return (memFd >= 0);
     }
+
+    pid_t getPid() const { return pid; }
+
+    // Заморозка/разморозка всего процесса (как SuspendAllThreads из виндового DLL).
+    // /proc/pid/mem пишется и без остановки, но для патча КОДА, который прямо сейчас
+    // исполняют другие потоки, остановка избавляет от torn write. SIGSTOP/SIGCONT
+    // тормозят весь процесс целиком — этого достаточно.
+    void freeze() const   { if (pid > 0) kill(pid, SIGSTOP); }
+    void unfreeze() const { if (pid > 0) kill(pid, SIGCONT); }
 
     template<typename T>
     bool read(uintptr_t address, T& value) const {
@@ -188,7 +204,7 @@ uintptr_t scanForCameraAddress(const ProcessMemory& mem, const MemoryRegion& reg
         size_t readSize = std::min(CHUNK_SIZE, static_cast<size_t>(region.end - addr));
         if (!mem.readBytes(addr, readSize, buffer)) continue;
 
-        for (size_t i = 0; i <= readSize - sizeof(float); i += 4) {
+        for (size_t i = 0; i + sizeof(float) <= readSize; i += 4) {
             float value;
             memcpy(&value, &buffer[i], sizeof(float));
             if (value >= targetDistance - 10 && value <= targetDistance + 10) {
@@ -484,7 +500,6 @@ public:
             std::cout << GREEN << "[+] Weather ID " << weatherId << " applied to " << count
                       << " locations (offset 0x" << std::hex << resolvedOffset << std::dec << ")." << RESET << "\n";
         }
-        std::cout << BLUE << "(Move your camera or reconnect to see changes for Sky)" << RESET << "\n";
     }
 };
 
@@ -574,7 +589,6 @@ class ParticlesManager {
 
 public:
     bool isFound() const { return sites.size() == signatures().size(); }
-    bool isCalibrated() const { return isFound(); } // отдельная калибровка не нужна
     size_t siteCount() const { return sites.size(); }
 
     // Патч включён, если на первом сайте стоит наш `mov eax,1` (0xB8).
@@ -649,6 +663,127 @@ public:
     }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  PlusManager — клиентское (client-side) включение Dota Plus ВНЕШНИМ патчем.
+//  Название «Eternal» из виндового инжектора тут не подходит: там код инжектится
+//  .so в адресное пространство (internal), а мы патчим ИЗВНЕ через /proc/pid/mem
+//  (external) — никакого нашего кода в памяти Доты нет.
+//
+//  Метод портирован из рабочего build/eternal_plus_extern.py (линуксовый аналог
+//  виндового Находка.txt). UI-гейты читают поле статуса подписки инструкцией
+//      mov reg, [rax+0x2c]     (3 байта:  8B 40 2C / 8B 50 2C)
+//  Патчим её инлайн на
+//      push 1; pop reg         (3 байта:  6A 01 58 / 6A 01 5A)
+//  → чтение статуса всегда = 1 → клиент считает Plus активным (клиентсайдно).
+//
+//  РАБОТАЕТ ТОЛЬКО ПРИ ЗАПУСКЕ: чтение статуса одноразовое, на OnSOCreated/welcome
+//  ДО GC-логина. Поэтому патчим из экрана запуска, ПОКА игра грузится. Менять Plus
+//  в уже идущей игре смысла нет → в игровом меню тоггла нет.
+//
+//  Адреса — ФИКСИРОВАННЫЕ vaddr внутри libclient.so (libBase + vaddr), три места
+//  потребителей (см. PATCHES в .py). Никакого vtbl-геттера — та цель (sub_5402eb0)
+//  оказалась проверкой EVENT-GAME (0x330) и крашила; патчим именно чтение поля.
+//
+//  Если оригинальные байты не совпали — Dota обновилась, бинарь сдвинулся: НЕ
+//  патчим (чтобы не покалечить), нужно перенайти vaddr под новый libclient.
+// ─────────────────────────────────────────────────────────────────────────────
+class PlusManager {
+    // Один потребитель статуса подписки: vaddr инструкции чтения поля + ожидаемые
+    // оригинальные байты + патч. ВСЕ три — фиксированной длины 3 байта (mov reg,
+    // [rax+0x2c]  ⇄  push 1; pop reg), ровно как PATCHES в eternal_plus_extern.py.
+    struct Site {
+        uintptr_t vaddr;                // смещение внутри libclient.so (как в .py)
+        std::vector<uint8_t> orig;      // mov reg,[rax+0x2c]  (8B 40 2C / 8B 50 2C)
+        std::vector<uint8_t> patch;     // push 1; pop reg     (6A 01 58 / 6A 01 5A)
+    };
+
+    // (vaddr, оригинал, патч) — синхронизировано с PATCHES в .py.
+    //   8B 40 2C = mov eax,[rax+0x2c]  -> 6A 01 58 = push 1; pop rax
+    //   8B 50 2C = mov edx,[rax+0x2c]  -> 6A 01 5A = push 1; pop rdx
+    static const std::vector<Site>& table() {
+        static const std::vector<Site> t = {
+            { 0x620e1a9, { 0x8b, 0x40, 0x2c }, { 0x6a, 0x01, 0x58 } },
+            { 0x6518326, { 0x8b, 0x40, 0x2c }, { 0x6a, 0x01, 0x58 } },
+            { 0x6895447, { 0x8b, 0x50, 0x2c }, { 0x6a, 0x01, 0x5a } },
+        };
+        return t;
+    }
+
+    uintptr_t libBase = 0;   // база загрузки libclient.so (ELF vaddr 0)
+    bool scanned = false;
+    bool verified = false;   // libBase известна и все сайты читаются как orig или patch
+
+    // Прочитать текущие 3 байта сайта по его vaddr.
+    bool readSite(const ProcessMemory& mem, const Site& s, std::vector<uint8_t>& out) const {
+        return mem.readBytes(libBase + s.vaddr, s.orig.size(), out);
+    }
+
+public:
+    bool isFound() const { return verified; }
+
+    // Патч включён, если ПЕРВЫЙ сайт сейчас читается как push 1 (0x6A).
+    bool isEnabled(const ProcessMemory& mem) const {
+        if (!verified) return false;
+        std::vector<uint8_t> buf;
+        return readSite(mem, table().front(), buf) && !buf.empty() && buf[0] == 0x6A;
+    }
+
+    // libBase — наименьший mapped-адрес libclient.so (ELF vaddr 0), как
+    // libclient_base() в .py. Сверяем все сайты с ожидаемыми байтами.
+    void scan(const ProcessMemory& mem, uintptr_t base) {
+        if (scanned) return;
+        scanned = true;
+        libBase = base;
+        if (libBase == 0) {
+            std::cout << RED << "[!] Dota Plus: libclient base unknown — cannot locate sites." << RESET << "\n";
+            return;
+        }
+
+        // .text мог ещё домапливаться (как retry-цикл в .py). Сайт валиден, если
+        // читается как оригинал ЛИБО как наш патч (уже включён в этой сессии).
+        bool allOk = false;
+        for (int attempt = 0; attempt < 8 && !allOk; ++attempt) {
+            allOk = true;
+            for (const auto& s : table()) {
+                std::vector<uint8_t> cur;
+                if (!readSite(mem, s, cur) || (cur != s.orig && cur != s.patch)) {
+                    allOk = false;
+                    break;
+                }
+            }
+            if (!allOk) std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+        verified = allOk;
+
+        if (verified)
+            std::cout << CYAN << "[*] Dota Plus: " << table().size()
+                      << " status-read sites verified (applied at launch)." << RESET << "\n";
+        else
+            std::cout << YELLOW << "[!] Dota Plus: status-read sites don't match "
+                      << "(game updated? re-find vaddr like in eternal_plus_extern.py)." << RESET << "\n";
+    }
+
+    // Запись под заморозкой процесса (torn-write по живому коду опасен). Патчим
+    // ТОЛЬКО сайты, что сейчас в оригинале; уже-патченные пропускаем.
+    void enable(const ProcessMemory& mem) {
+        if (!verified || isEnabled(mem)) return;
+        mem.freeze();
+        int n = 0;
+        for (const auto& s : table()) {
+            std::vector<uint8_t> cur;
+            if (!readSite(mem, s, cur)) continue;
+            if (cur == s.patch) { n++; continue; }                  // уже стоит
+            if (cur != s.orig) continue;                            // чужие байты — не трогаем
+            if (mem.writeBytes(libBase + s.vaddr, s.patch)) n++;
+        }
+        mem.unfreeze();
+        std::cout << GREEN << "[+] Dota Plus ON (client-side) — status reads forced to Active at launch ("
+                  << n << "/" << table().size() << " sites)!" << RESET << "\n";
+    }
+    // Тоггла «выключить» в игре нет: статус читается одноразово на логине, поэтому
+    // править его в уже идущей игре бессмысленно. Plus включается только при запуске.
+};
+
 void printWeatherList() {
     struct WeatherItem {
         std::string color;
@@ -684,52 +819,147 @@ void printWeatherList() {
     }
 }
 
-int main(int, char**) {
-    printBanner();
+// ─────────────────────────────────────────────────────────────────────────────
+//  Запуск Dota 2 через Steam и ожидание старта процесса.
+//  Возвращает PID или 0 при таймауте (60 секунд).
+// ─────────────────────────────────────────────────────────────────────────────
+// Сбросить root-привилегии до пользователя, вызвавшего sudo, и запустить Steam-URI.
+// Вызывается ТОЛЬКО в дочернем процессе и завершается exec/_exit.
+// Steam отказывается работать от root, поэтому уходим под SUDO_UID/SUDO_GID и
+// восстанавливаем пользовательское окружение (HOME, XDG_RUNTIME_DIR), чтобы Steam
+// нашёл свой сокет уже запущенного инстанса.
+static void dropPrivAndLaunchSteam() {
+    const char* sudo_uid  = getenv("SUDO_UID");
+    const char* sudo_gid  = getenv("SUDO_GID");
+    const char* sudo_user = getenv("SUDO_USER");
 
-    if (geteuid() != 0) {
-        std::cerr << RED << "[!] ROOT REQUIRED. Run with sudo." << RESET << "\n";
-        return 1;
+    if (sudo_uid && sudo_gid && sudo_user) {
+        const uid_t uid = static_cast<uid_t>(std::atoi(sudo_uid));
+        const gid_t gid = static_cast<gid_t>(std::atoi(sudo_gid));
+
+        // Порядок важен: группы → gid → uid (после setuid вернуть привилегии нельзя).
+        if (initgroups(sudo_user, gid) != 0) _exit(126);
+        if (setgid(gid) != 0)                _exit(126);
+        if (setuid(uid) != 0)                _exit(126);
+
+        if (const struct passwd* pw = getpwuid(uid))
+            setenv("HOME", pw->pw_dir, 1);
+        char xdg[64];
+        snprintf(xdg, sizeof(xdg), "/run/user/%u", static_cast<unsigned>(uid));
+        setenv("XDG_RUNTIME_DIR", xdg, 1);
+        setenv("USER", sudo_user, 1);
+        setenv("LOGNAME", sudo_user, 1);
     }
 
-    auto pids = findProcessesByName("dota2");
-    if (pids.empty()) {
-        std::cerr << RED << "[!] Dota 2 process not found. Launch the game first." << RESET << "\n";
-        return 1;
-    }
-    pid_t dotaPid = pids[0];
-    std::cout << "[*] Attached to Dota 2 PID: " << GREEN << dotaPid << RESET << "\n";
+    // PATH-поиск (execlp) — на разных дистрибутивах бинарь лежит по-разному.
+    execlp("xdg-open", "xdg-open", "steam://run/570", static_cast<char*>(nullptr));
+    execlp("steam",    "steam",    "steam://run/570", static_cast<char*>(nullptr));
+    _exit(127);
+}
 
+static pid_t launchAndWaitForDota() {
+    std::cout << CYAN << "[*] Launching Dota 2 via Steam (as invoking user)..." << RESET << "\n";
+
+    if (getenv("SUDO_USER") == nullptr) {
+        std::cout << YELLOW << "[!] SUDO_USER not set — run the tool with sudo, "
+                  << "otherwise Steam won't start as root." << RESET << "\n";
+    }
+
+    signal(SIGCHLD, SIG_IGN); // авто-reap: лаунчер-child не должен висеть зомби
+
+    if (fork() == 0) {
+        // child: уходим под обычного пользователя и отдаём URI Steam'у
+        dropPrivAndLaunchSteam();
+        _exit(1); // недостижимо
+    }
+    // Не ждём child — он завершится быстро, Steam подхватит URI сам
+
+    std::cout << "[*] Waiting for dota2 process";
+    std::cout.flush();
+
+    constexpr int TIMEOUT_SEC = 120;
+    for (int i = 0; i < TIMEOUT_SEC * 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        auto pids = findProcessesByName("dota2");
+        if (!pids.empty()) {
+            std::cout << "\n";
+            return pids[0];
+        }
+        if (i % 4 == 0) { std::cout << "."; std::cout.flush(); }
+    }
+    std::cout << "\n" << RED << "[!] Timeout waiting for Dota 2." << RESET << "\n";
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ожидание загрузки libclient.so в карту памяти процесса.
+//  Нужно для код-патчей (партиклы): патчить можно только после того, как .so отмаплен.
+// ─────────────────────────────────────────────────────────────────────────────
+static bool waitForClientLib(pid_t pid, int timeoutSec = 60) {
+    std::cout << "[*] Waiting for libclient.so";
+    std::cout.flush();
+    for (int i = 0; i < timeoutSec * 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::string mapsPath = "/proc/" + std::to_string(pid) + "/maps";
+        std::ifstream f(mapsPath);
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.find("libclient.so") != std::string::npos) {
+                std::cout << "\n";
+                return true;
+            }
+        }
+        if (i % 4 == 0) { std::cout << "."; std::cout.flush(); }
+    }
+    std::cout << "\n" << RED << "[!] Timeout waiting for libclient.so." << RESET << "\n";
+    return false;
+}
+
+// Какие «включил и забыл» код-патчи активировать сразу после запуска игры.
+// Камера и погода интерактивны (нужны значения/калибровка) — их тут нет.
+struct LaunchSelection {
+    bool particles = false;
+    bool dotaPlus  = false;  // Dota Plus (client-side): ставить ДО GC-логина, чтобы welcome/UI открылись
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Экстернал-цикл: основной UI для работы с запущенной Dota.
+//    sel          — что применить сразу (только если launchedByUs).
+//    launchedByUs — true, если Доту запустили мы → можно сразу включить выбранные
+//                   на экране запуска моды.
+// ─────────────────────────────────────────────────────────────────────────────
+static void runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launchedByUs) {
     ProcessMemory mem;
     if (!mem.attach(dotaPid)) {
-        std::cerr << RED << "[!] Failed to open process memory." << RESET << "\n";
-        return 1;
+        std::cerr << RED << "[!] Failed to open process memory (PID " << dotaPid << ")." << RESET << "\n";
+        return;
     }
 
     std::cout << "[*] Parsing memory maps...\n";
     auto regions = mem.getMemoryRegions();
     std::vector<MemoryRegion> clientRegions;
     std::vector<MemoryRegion> dataRegions;
+    uintptr_t libBase = 0; // база загрузки libclient.so (минимальный mapped-адрес = ELF vaddr 0)
 
     for (const auto& region : regions) {
         if (region.path.find("libclient.so") != std::string::npos ||
             region.path.find("client.dll") != std::string::npos) {
+            if (libBase == 0 || region.start < libBase) libBase = region.start;
             if (region.perms.find('x') != std::string::npos) clientRegions.push_back(region);
             else if (region.perms.find("rw") != std::string::npos) dataRegions.push_back(region);
         }
     }
-
     std::cout << "[*] Found " << clientRegions.size() << " executable regions.\n";
 
-    constexpr float DEFAULT_CAM_DISTANCE = 1200.0f; // дефолтная дистанция камеры в Dota
+    constexpr float DEFAULT_CAM_DISTANCE = 1200.0f;
 
     WeatherManager weatherMgr;
     ParticlesManager particlesMgr;
+    PlusManager plusMgr;
     uintptr_t cameraAddr = 0;
     bool running = true;
     float currentCamDist = DEFAULT_CAM_DISTANCE;
 
-    // Привязать камеру: найти в памяти float рядом с указанной дистанцией.
     auto linkCameraAt = [&](float dist) -> bool {
         cameraAddr = 0;
         for (const auto& region : dataRegions) {
@@ -738,12 +968,11 @@ int main(int, char**) {
         }
         if (cameraAddr != 0) {
             currentCamDist = dist;
-            weatherMgr.persistCamera(cameraAddr); // запомнить адрес на будущие запуски
+            weatherMgr.persistCamera(cameraAddr);
         }
         return cameraAddr != 0;
     };
 
-    // Спросить желаемую дистанцию и записать её (камера уже должна быть привязана).
     auto promptAndSetDistance = [&]() {
         std::cout << "Enter desired distance (e.g. 1400, 1350): " << CYAN;
         float val;
@@ -765,10 +994,9 @@ int main(int, char**) {
 
     weatherMgr.scan(mem, clientRegions);
     particlesMgr.scan(mem, clientRegions);
+    plusMgr.scan(mem, libBase); // Dota Plus патчит фиксированные vaddr = libBase + offset
 
-    // Восстановление дистанции камеры из прошлого запуска (та же сессия Dota):
-    // если сохранённый адрес ещё жив и хранит правдоподобную дистанцию — цепляемся
-    // сразу, чтобы [1] менял даже уже изменённую дистанцию без релинка.
+    // Восстановление адреса камеры из файла состояния той же сессии Dota
     if (const uintptr_t rc = weatherMgr.recoveredCameraAddr()) {
         float dist = 0.0f;
         if (mem.read(rc, dist) && dist > 100.0f && dist < 10000.0f) {
@@ -777,6 +1005,24 @@ int main(int, char**) {
             std::cout << GREEN << "[+] Camera linked from previous session — distance "
                       << dist << "." << RESET << "\n";
         }
+    }
+
+    // Применяем выбранные на экране запуска моды сразу после старта игры.
+    if (launchedByUs && sel.particles) {
+        if (particlesMgr.isFound() && !particlesMgr.isEnabled(mem)) particlesMgr.toggle(mem);
+        else if (!particlesMgr.isFound())
+            std::cout << YELLOW << "[!] Particles selected, but gates not found." << RESET << "\n";
+    }
+    // Dota Plus (client-side) патчит ЧТЕНИЕ статуса подписки (метод из
+    // eternal_plus_extern.py) — это нужно поставить ДО GC-логина, чтобы welcome/UI
+    // открылись уже как Plus. Работает ТОЛЬКО при запуске, поэтому применяем прямо
+    // здесь, сразу после старта игры (мы пришли с экрана запуска).
+    if (launchedByUs && sel.dotaPlus) {
+        if (plusMgr.isFound() && !plusMgr.isEnabled(mem))
+            plusMgr.enable(mem);
+        else if (!plusMgr.isFound())
+            std::cout << YELLOW << "[!] Dota Plus selected, but status-read sites not verified "
+                      << "(game updated? re-find vaddr as in eternal_plus_extern.py)." << RESET << "\n";
     }
 
     std::cout << "\nPress Enter to continue...";
@@ -789,6 +1035,9 @@ int main(int, char**) {
         const std::string divider = "  " + GRAY + "──────────────────────────────────────────────" + RESET + "\n";
 
         // ── Статус ──
+        std::cout << "  " << GREEN << "●" << RESET << " Dota 2   " << GRAY << ":" << RESET << " "
+                  << GREEN << "running" << RESET << GRAY << "  PID " << dotaPid << RESET << "\n";
+
         std::cout << "  " << (cameraAddr != 0 ? GREEN : RED) << "●" << RESET
                   << " Camera   " << GRAY << ":" << RESET << " ";
         if (cameraAddr != 0) std::cout << GREEN << "linked" << RESET << GRAY << "  " << currentCamDist << RESET;
@@ -818,6 +1067,18 @@ int main(int, char**) {
         else
             std::cout << YELLOW << "●" << RESET << " Particles" << GRAY << ":" << RESET << " "
                       << GRAY << "default" << RESET;
+        std::cout << "\n";
+
+        std::cout << "  ";
+        if (!plusMgr.isFound())
+            std::cout << RED << "●" << RESET << " Dota Plus" << GRAY << ":" << RESET << " "
+                      << RED << "not found" << RESET;
+        else if (plusMgr.isEnabled(mem))
+            std::cout << GREEN << "●" << RESET << " Dota Plus" << GRAY << ":" << RESET << " "
+                      << GREEN << "ON (client-side, launch patch)" << RESET;
+        else
+            std::cout << YELLOW << "●" << RESET << " Dota Plus" << GRAY << ":" << RESET << " "
+                      << GRAY << "off (enable at launch)" << RESET;
         std::cout << "\n\n";
 
         // ── Главные действия ──
@@ -832,19 +1093,18 @@ int main(int, char**) {
             std::cout << GRAY << "[3]  Particles fog-reveal (gates not found)" << RESET << "\n";
         std::cout << "\n";
 
-        // ── Второстепенные сервисные действия ──
+        // ── Сервисные действия ──
         std::cout << "   " << GRAY << "[c] relink camera (if already zoomed)" << RESET << "\n";
         std::cout << "   ";
         if (weatherNeedsCalib)
             std::cout << BOLD << YELLOW << "[t]" << RESET << YELLOW << " Recalibrate weather" << RESET
-                      << YELLOW << "  ← сделай это сначала" << RESET;
+                      << YELLOW << "  ← do this first" << RESET;
         else
             std::cout << GRAY << "[t] recalibrate weather" << RESET;
         std::cout << GRAY << "   ·   [0] exit" << RESET << "\n";
         std::cout << divider;
         std::cout << "\n   " << CYAN << "❯ " << RESET;
 
-        // Команды — строкой, чтобы принимать и цифры, и буквы 't'/'c'.
         std::string cmd;
         if (!(std::cin >> cmd)) {
             std::cin.clear();
@@ -858,40 +1118,32 @@ int main(int, char**) {
         else if (cmd == "0")               choice = 0;
         else if (cmd == "1")               choice = 1;
         else if (cmd == "2")               choice = 2;
-        else if (cmd == "3")               choice = 5; // частицы — основное действие
-        else                               continue; // неизвестная команда — перерисовать меню
+        else if (cmd == "3")               choice = 5;
+        else                               continue;
 
         switch (choice) {
-            case 0: {
-                running = false;
-                break;
-            }
+            case 0: running = false; break;
+
             case 1: {
-                // Авто-подхват: если камера ещё не привязана, считаем, что она на
-                // дефолте, и цепляемся без лишних вопросов.
                 if (cameraAddr == 0) {
                     std::cout << YELLOW << "Linking camera (default " << DEFAULT_CAM_DISTANCE
                               << ")..." << RESET << "\n";
                     linkCameraAt(DEFAULT_CAM_DISTANCE);
                 }
-
                 if (cameraAddr != 0) {
                     promptAndSetDistance();
                 } else {
                     std::cout << RED << "[-] Camera not at default " << DEFAULT_CAM_DISTANCE
-                              << ".\n    Если она уже отдалена — нажми [c] и введи её текущую дистанцию."
+                              << ".\n    If it's already zoomed out — press [c] and enter the current distance."
                               << RESET << "\n";
                 }
-
                 std::cout << "\nPress Enter to return...";
-                std::cin.ignore();
-                std::cin.get();
+                std::cin.ignore(); std::cin.get();
                 break;
             }
+
             case 4: {
-                // Релинк по текущей дистанции — для случая, когда камера уже была
-                // отдалена, а программу перезапустили (дефолт 1200 уже не найдётся).
-                std::cout << "\nВведи ТЕКУЩУЮ дистанцию камеры (что стоит сейчас в игре): " << CYAN;
+                std::cout << "\nEnter CURRENT camera distance: " << CYAN;
                 float scanVal;
                 const bool ok = static_cast<bool>(std::cin >> scanVal);
                 std::cout << RESET;
@@ -906,86 +1158,178 @@ int main(int, char**) {
                                   << std::dec << RESET << "\n";
                         promptAndSetDistance();
                     } else {
-                        std::cout << RED << "[-] Не найдено. Подвигай камеру в игре и введи точное значение."
+                        std::cout << RED << "[-] Not found. Move the camera and enter the exact value."
                                   << RESET << "\n";
                     }
                 }
-
                 std::cout << "\nPress Enter to return...";
-                std::cin.ignore();
-                std::cin.get();
+                std::cin.ignore(); std::cin.get();
                 break;
             }
+
             case 2: {
                 printWeatherList();
                 std::cout << "\n" << CYAN << "Select ID: " << RESET;
-                int id;
-                std::cin >> id;
-
+                int id; std::cin >> id;
                 weatherMgr.applyWeather(mem, id);
-
                 std::cout << "\nPress Enter to return...";
-                std::cin.ignore();
-                std::cin.get();
+                std::cin.ignore(); std::cin.get();
                 break;
             }
+
             case 3: {
                 auto offsets = weatherMgr.trialOffsets();
                 if (offsets.empty()) {
                     std::cout << RED << "[!] No candidate offsets near baseline to try." << RESET << "\n";
                 } else {
-                    constexpr int TEST_WEATHER = 1; // Snow — частицы снега видно на земле сразу
+                    constexpr int TEST_WEATHER = 1;
                     std::cout << "\n" << BOLD << "Auto-tune offset" << RESET << "\n"
-                              << "Программа по очереди ставит ВИДНУЮ погоду (Snow) на каждый кандидат,\n"
-                              << "а ты смотришь в игру и отвечаешь y (да) / n (нет) / q (стоп).\n"
-                              << YELLOW << "Зайди в матч или демо, где видно небо/землю, потом начинай.\n" << RESET
-                              << "Кандидатов рядом с базой: " << offsets.size() << "\n";
-                    std::cout << "Нажми Enter чтобы начать...";
+                              << "The tool applies a visible weather (Snow) for each candidate offset.\n"
+                              << "Watch the game and answer y (yes) / n (no) / q (stop).\n"
+                              << YELLOW << "Enter a match or demo where sky/ground is visible before starting.\n" << RESET
+                              << "Candidates near baseline: " << offsets.size() << "\n";
+                    std::cout << "Press Enter to start...";
                     std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
                     bool found = false;
                     for (const uint32_t off : offsets) {
                         const int n = weatherMgr.applyAt(mem, off, TEST_WEATHER);
                         std::cout << "\n[*] Offset 0x" << std::hex << off << std::dec
-                                  << " — патч в " << n << " местах.\n";
-                        std::cout << CYAN << "    Погода в игре ИЗМЕНИЛАСЬ? (y/n/q): " << RESET;
-                        std::string ans;
-                        std::cin >> ans;
-
+                                  << " — patched at " << n << " sites.\n";
+                        std::cout << CYAN << "    Did weather CHANGE in game? (y/n/q): " << RESET;
+                        std::string ans; std::cin >> ans;
                         if (ans == "y" || ans == "Y") {
                             weatherMgr.lock(off);
-                            std::cout << GREEN << "[+] Оффсет 0x" << std::hex << off << std::dec
-                                      << " зафиксирован! Теперь меняй погоду через [2]." << RESET << "\n";
-                            std::cout << YELLOW << "    Впиши HINT_OFFSET = 0x" << std::hex << off << std::dec
-                                      << " в исходник, чтобы в след. раз пробовался первым." << RESET << "\n";
+                            std::cout << GREEN << "[+] Offset 0x" << std::hex << off << std::dec
+                                      << " confirmed! Use [2] to change weather now." << RESET << "\n";
+                            std::cout << YELLOW << "    Update HINT_OFFSET = 0x" << std::hex << off << std::dec
+                                      << " in the source so it's tried first next time." << RESET << "\n";
                             found = true;
                             break;
                         }
-
-                        weatherMgr.revert(mem); // не сработало — вернуть оригинальные байты
+                        weatherMgr.revert(mem);
                         if (ans == "q" || ans == "Q") break;
                     }
-
                     if (!found)
-                        std::cout << RED << "\n[!] Ни один близкий оффсет не сработал. "
-                                            "Увеличь TRIAL_WINDOW в исходнике или ищи в Binary Ninja." << RESET << "\n";
+                        std::cout << RED << "\n[!] No nearby offset worked. "
+                                            "Increase TRIAL_WINDOW or search in Binary Ninja." << RESET << "\n";
                 }
-
                 std::cout << "\nPress Enter to return...";
-                std::cin.ignore();
-                std::cin.get();
+                std::cin.ignore(); std::cin.get();
                 break;
             }
+
             case 5: {
                 particlesMgr.toggle(mem);
-
                 std::cout << "\nPress Enter to return...";
-                std::cin.ignore();
-                std::cin.get();
+                std::cin.ignore(); std::cin.get();
                 break;
             }
         }
     }
+}
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Экран запуска: Dota 2 ещё не запущена.
+//  Пользователь тогглит, какие моды включить при запуске, затем жмёт [L].
+//  Возвращает:
+//    > 0  — PID запущенной Dota; sel = что включить сразу после старта
+//    0    — пользователь вышел
+// ─────────────────────────────────────────────────────────────────────────────
+static pid_t runLaunchScreen(LaunchSelection& sel) {
+    sel = LaunchSelection{}; // по умолчанию ничего не включено — «может не быть вайба»
+    while (true) {
+        printBanner();
+        const std::string divider = "  " + GRAY + "──────────────────────────────────────────────" + RESET + "\n";
+
+        std::cout << "  " << RED << "●" << RESET << " Dota 2   " << GRAY << ":" << RESET << " "
+                  << RED << "not running" << RESET << "\n\n";
+
+        auto mark = [](bool on) {
+            return on ? (GREEN + "[x]" + RESET) : (GRAY + "[ ]" + RESET);
+        };
+
+        std::cout << "  " << BOLD << "Enable at launch:" << RESET << "\n";
+        std::cout << "   " << mark(sel.dotaPlus) << " " << BOLD << CYAN << "[d]" << RESET
+                  << "  Dota Plus\n";
+        std::cout << "   " << mark(sel.particles) << " " << BOLD << CYAN << "[p]" << RESET
+                  << "  Particles fog-reveal\n";
+        std::cout << "   " << GRAY << "(camera and weather are interactive — available in the menu after launch)"
+                  << RESET << "\n\n";
+
+        std::cout << divider;
+        std::cout << "   " << BOLD << GREEN << "[L]" << RESET << "  Launch Dota 2"
+                  << GRAY << "  (with selected mods)" << RESET << "\n";
+        std::cout << "   " << GRAY << "[d]/[p] toggle mod   ·   [0] exit" << RESET << "\n";
+        std::cout << divider;
+        std::cout << "\n   " << CYAN << "❯ " << RESET;
+
+        std::string cmd;
+        if (!(std::cin >> cmd)) {
+            std::cin.clear();
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            continue;
+        }
+
+        if (cmd == "0") return 0;
+        if (cmd == "d" || cmd == "D") { sel.dotaPlus  = !sel.dotaPlus;  continue; }
+        if (cmd == "p" || cmd == "P") { sel.particles = !sel.particles; continue; }
+
+        if (cmd == "L" || cmd == "l") {
+            pid_t pid = launchAndWaitForDota();
+            if (pid == 0) {
+                std::cout << RED << "[!] Failed to detect Dota 2. Try again or launch manually.\n" << RESET;
+                std::cout << "\nPress Enter to return...";
+                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                std::cin.get();
+                continue;
+            }
+            // Код-патч требует загруженной libclient.so. Если выбран мод —
+            // дождёмся её. Для Dota Plus патчим как можно РАНЬШE (до GC-логина),
+            // поэтому init-паузу держим короткой.
+            if (sel.particles || sel.dotaPlus) {
+                if (!waitForClientLib(pid)) {
+                    std::cout << YELLOW << "[!] libclient.so not loaded — mods can be enabled manually from the menu.\n" << RESET;
+                    sel = LaunchSelection{};
+                } else {
+                    // Короткая пауза: .so отмаплена, даём ей чуть проинициализироваться,
+                    // но успеваем ДО обработки статуса подписки от GC.
+                    std::cout << "[*] Waiting for init (patching before GC login)...";
+                    std::cout.flush();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+                    std::cout << " done.\n";
+                }
+            }
+            return pid;
+        }
+    }
+}
+
+int main(int, char**) {
+    printBanner();
+
+    if (geteuid() != 0) {
+        std::cerr << RED << "[!] ROOT REQUIRED. Run with sudo." << RESET << "\n";
+        return 1;
+    }
+
+    auto pids = findProcessesByName("dota2");
+
+    pid_t dotaPid = 0;
+    LaunchSelection sel;
+    bool launchedByUs = false;
+
+    if (pids.empty()) {
+        // Dota не запущена — экран выбора модов + запуск
+        dotaPid = runLaunchScreen(sel);
+        if (dotaPid == 0) return 0; // пользователь вышел
+        launchedByUs = true;
+    } else {
+        // Dota уже работает — цепляемся к процессу.
+        dotaPid = pids[0];
+        std::cout << "[*] Attached to Dota 2 PID: " << GREEN << dotaPid << RESET << "\n";
+    }
+
+    runExternalMode(dotaPid, sel, launchedByUs);
     return 0;
 }
