@@ -24,4 +24,5 @@ private:
     void runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launchedByUs);
 
     static void printWeatherList();
+    static void printRiverList();
 };
