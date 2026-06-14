@@ -16,6 +16,7 @@
 #include "particles_manager.hpp"
 #include "plus_manager.hpp"
 #include "process_memory.hpp"
+#include "river_manager.hpp"
 #include "weather_manager.hpp"
 
 using namespace ansi;
@@ -78,6 +79,38 @@ void App::printWeatherList() {
     }
 }
 
+void App::printRiverList() {
+    struct RiverItem {
+        std::string color;
+        std::string icon;
+        char key;
+        std::string name;
+    };
+
+    static const std::vector<RiverItem> items = {
+        { WHITE,  "\U000F11FD", '1', "Chrome"  },
+        { YELLOW, "\uEE8E",     '2', "Dry"     },
+        { GREEN,  "\uE275",     '3', "Slime"   },
+        { PURPLE, "\U000F1053", '4', "Oil"     },
+        { CYAN,   "\U000F140B", '5', "Electric"},
+        { PINK,   "\U000F1308", '6', "Potion"  },
+        { RED,    "\uE275",     '7', "Blood"   },
+        { GRAY,   "•",          '0', "Default" },
+    };
+
+    std::cout << "\n" << BOLD << "River:" << RESET << "\n";
+    for (size_t i = 0; i < items.size(); i += 2) {
+        for (size_t j = i; j < i + 2 && j < items.size(); ++j) {
+            const auto& r = items[j];
+            const std::string label = std::string("[") + r.key + "] " + r.name;
+            std::cout << "   " << r.color << r.icon << RESET << "  " << label;
+            for (int pad = static_cast<int>(label.size()); pad < 16; ++pad)
+                std::cout << ' ';
+        }
+        std::cout << "\n";
+    }
+}
+
 void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launchedByUs) {
     ProcessMemory mem;
     if (!mem.attach(dotaPid)) {
@@ -102,12 +135,14 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
     std::cout << "[*] Found " << clientRegions.size() << " executable regions.\n";
 
     WeatherManager weatherMgr;
+    RiverManager riverMgr;
     ParticlesManager particlesMgr;
     PlusManager plusMgr;
     CameraManager camera(mem, dataRegions, [&](uintptr_t addr) { weatherMgr.persistCamera(addr); });
 
     weatherMgr.scan(mem, clientRegions);
     particlesMgr.scan(mem, clientRegions);
+    riverMgr.scan(mem, libBase);
     plusMgr.scan(mem, libBase); // Dota Plus патчит фиксированные vaddr = libBase + offset
 
     // Восстановление адреса камеры из файла состояния той же сессии Dota.
@@ -166,6 +201,15 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
             statusRow(RED, "Weather  ", RED + "not found" + RESET);
         }
 
+        if (!riverMgr.isFound()) {
+            statusRow(RED, "River    ", RED + "not found" + RESET);
+        } else if (const int rid = riverMgr.currentId(mem); rid > 0) {
+            std::ostringstream v; v << GREEN << "set" << RESET << GRAY << "  id " << rid << RESET;
+            statusRow(GREEN, "River    ", v.str());
+        } else {
+            statusRow(GREEN, "River    ", GRAY + "ready (default)" + RESET);
+        }
+
         if (!particlesMgr.isFound())
             statusRow(RED, "Particles", RED + "not found" + RESET);
         else if (particlesMgr.isEnabled(mem))
@@ -191,6 +235,7 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
                       << GRAY << "(toggle)" << RESET << "\n";
         else
             std::cout << GRAY << "[3]  Particles fog-reveal (gates not found)" << RESET << "\n";
+        std::cout << "   " << BOLD << CYAN << "[4]" << RESET << "  Change river\n";
         std::cout << "\n";
 
         // ── Сервисные действия ──
@@ -258,6 +303,13 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
             std::cout << "\n" << CYAN << "Select ID: " << RESET;
             int id;
             if (std::cin >> id) weatherMgr.applyWeather(mem, id);
+            else { console::flushLine(); std::cout << RED << "Bad input." << RESET << "\n"; }
+            console::pause();
+        } else if (cmd == "4") {
+            printRiverList();
+            std::cout << "\n" << CYAN << "Select ID: " << RESET;
+            int id;
+            if (std::cin >> id) riverMgr.applyRiver(mem, id);
             else { console::flushLine(); std::cout << RED << "Bad input." << RESET << "\n"; }
             console::pause();
         } else if (cmd == "t" || cmd == "T") {
