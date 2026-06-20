@@ -9,7 +9,6 @@ class App {
 public:
     int run();
 
-private:
     // Какие «включил и забыл» код-патчи активировать сразу после запуска игры.
     // Камера и погода интерактивны (нужны значения/калибровка) — их тут нет.
     struct LaunchSelection {
@@ -17,6 +16,7 @@ private:
         bool dotaPlus  = false; // Dota Plus (client-side): ставить ДО GC-логина
     };
 
+private:
     // Экран запуска: Dota ещё не запущена. Возвращает PID запущенной игры или 0.
     pid_t runLaunchScreen(LaunchSelection& sel);
 

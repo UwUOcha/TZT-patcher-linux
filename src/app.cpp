@@ -1,12 +1,18 @@
 #include "app.hpp"
 
 #include <chrono>
+#include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <pwd.h>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
+#include <termios.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "ansi.hpp"
@@ -40,6 +46,119 @@ bool readFloat(const std::string& prompt, float& out) {
         return false;
     }
     return true;
+}
+
+std::string realHome() {
+    if (const char* su = std::getenv("SUDO_USER"))
+        if (struct passwd* pw = getpwnam(su)) return pw->pw_dir;
+    if (const char* h = std::getenv("HOME")) return h;
+    if (struct passwd* pw = getpwuid(getuid())) return pw->pw_dir;
+    return {};
+}
+
+bool realIds(uid_t& uid, gid_t& gid) {
+    if (const char* su = std::getenv("SUDO_USER"))
+        if (struct passwd* pw = getpwnam(su)) {
+            uid = pw->pw_uid;
+            gid = pw->pw_gid;
+            return true;
+        }
+    return false;
+}
+
+void chownToRealUser(const std::string& path) {
+    uid_t uid;
+    gid_t gid;
+    if (realIds(uid, gid)) {
+        if (::chown(path.c_str(), uid, gid) != 0) {
+            // Non-fatal: root can still read/write the settings file.
+        }
+    }
+}
+
+std::string settingsPath() {
+    const std::string home = realHome();
+    return home.empty() ? ".tzt_patcher_settings" : home + "/.config/tzt_patcher/settings.conf";
+}
+
+void ensureParentDir(const std::string& path) {
+    const auto slash = path.find_last_of('/');
+    if (slash == std::string::npos) return;
+    const std::string dir = path.substr(0, slash);
+    std::string cur;
+    if (!dir.empty() && dir[0] == '/') cur = "/";
+    size_t i = (cur == "/") ? 1 : 0;
+    while (i <= dir.size()) {
+        const size_t j = dir.find('/', i);
+        const std::string part = dir.substr(0, j == std::string::npos ? dir.size() : j);
+        if (!part.empty()) {
+            ::mkdir(part.c_str(), 0755);
+            chownToRealUser(part);
+        }
+        if (j == std::string::npos) break;
+        i = j + 1;
+    }
+}
+
+App::LaunchSelection loadLaunchSelection() {
+    App::LaunchSelection sel;
+    std::ifstream f(settingsPath());
+    std::string line;
+    while (std::getline(f, line)) {
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = line.substr(0, eq);
+        const std::string val = line.substr(eq + 1);
+        const bool on = (val == "1" || val == "true" || val == "on");
+        if (key == "dota_plus") sel.dotaPlus = on;
+        else if (key == "particles") sel.particles = on;
+    }
+    return sel;
+}
+
+void saveLaunchSelection(const App::LaunchSelection& sel) {
+    const std::string path = settingsPath();
+    ensureParentDir(path);
+    std::ofstream f(path);
+    if (!f) return;
+    f << "dota_plus=" << (sel.dotaPlus ? 1 : 0) << "\n";
+    f << "particles=" << (sel.particles ? 1 : 0) << "\n";
+    f.close();
+    chownToRealUser(path);
+}
+
+char readKey() {
+    std::cout.flush();
+    if (!::isatty(STDIN_FILENO)) {
+        char c = 0;
+        std::cin.get(c);
+        return c;
+    }
+
+    termios oldt{};
+    if (::tcgetattr(STDIN_FILENO, &oldt) != 0) {
+        char c = 0;
+        std::cin.get(c);
+        return c;
+    }
+
+    termios raw = oldt;
+    raw.c_lflag &= static_cast<unsigned>(~(ICANON | ECHO));
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    ::tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+
+    char c = 0;
+    const ssize_t n = ::read(STDIN_FILENO, &c, 1);
+    ::tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    return n == 1 ? c : 0;
+}
+
+void pauseAfterHotkey(const std::string& msg = "\nPress Enter to return...") {
+    std::cout << msg;
+    std::cout.flush();
+    std::cin.clear();
+    std::cin.get();
 }
 
 } // namespace
@@ -359,47 +478,51 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
 }
 
 pid_t App::runLaunchScreen(LaunchSelection& sel) {
-    sel = LaunchSelection{}; // по умолчанию ничего не включено — «может не быть вайба»
+    sel = loadLaunchSelection();
     while (true) {
         printBanner();
 
         statusRow(RED, "Dota 2   ", RED + "not running" + RESET);
-        std::cout << "\n";
 
         auto mark = [](bool on) {
             return on ? (GREEN + "[x]" + RESET) : (GRAY + "[ ]" + RESET);
         };
 
-        std::cout << "  " << BOLD << "Enable at launch:" << RESET << "\n";
-        std::cout << "   " << mark(sel.dotaPlus) << " " << BOLD << CYAN << "[d]" << RESET
-                  << "  Dota Plus\n";
-        std::cout << "   " << mark(sel.particles) << " " << BOLD << CYAN << "[p]" << RESET
-                  << "  Particles fog-reveal\n";
-        std::cout << "   " << GRAY << "(camera and weather are interactive — available in the menu after launch)"
-                  << RESET << "\n\n";
-
+        std::cout << "\n";
         std::cout << console::divider();
-        std::cout << "   " << BOLD << GREEN << "[L]" << RESET << "  Launch Dota 2"
+        std::cout << "   " << BOLD << GREEN << "[ENTER]" << RESET << "  Launch Dota 2"
                   << GRAY << "  (with selected mods)" << RESET << "\n";
-        std::cout << "   " << GRAY << "[d]/[p] toggle mod   ·   [0] exit" << RESET << "\n";
+        std::cout << "\n";
+        std::cout << "   " << mark(sel.dotaPlus) << " " << BOLD << CYAN << "[1]" << RESET
+                  << "  Dota Plus\n";
+        std::cout << "   " << mark(sel.particles) << " " << BOLD << CYAN << "[2]" << RESET
+                  << "  Particles fog-reveal\n";
+        std::cout << "\n";
+        std::cout << "   " << GRAY << "[0] exit" << RESET << "\n";
         std::cout << console::divider();
         std::cout << "\n   " << CYAN << "❯ " << RESET;
 
-        std::string cmd;
-        if (!(std::cin >> cmd)) {
-            console::flushLine();
+        const char key = readKey();
+        if (key && key != '\n' && key != '\r') std::cout << key << "\n";
+        else std::cout << "\n";
+
+        if (key == '0') return 0;
+        if (key == '1') {
+            sel.dotaPlus = !sel.dotaPlus;
+            saveLaunchSelection(sel);
+            continue;
+        }
+        if (key == '2') {
+            sel.particles = !sel.particles;
+            saveLaunchSelection(sel);
             continue;
         }
 
-        if (cmd == "0") return 0;
-        if (cmd == "d" || cmd == "D") { sel.dotaPlus  = !sel.dotaPlus;  continue; }
-        if (cmd == "p" || cmd == "P") { sel.particles = !sel.particles; continue; }
-
-        if (cmd == "L" || cmd == "l") {
+        if (key == '\n' || key == '\r') {
             const pid_t pid = launcher::launchAndWaitForDota();
             if (pid == 0) {
                 std::cout << RED << "[!] Failed to detect Dota 2. Try again or launch manually.\n" << RESET;
-                console::pause();
+                pauseAfterHotkey();
                 continue;
             }
             // Код-патч требует загруженной libclient.so. Если выбран мод — дождёмся её.
