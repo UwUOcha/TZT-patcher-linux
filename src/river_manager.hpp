@@ -8,14 +8,17 @@
 //
 // Тип реки — netvar m_nRiverType на C_DOTAGamerules (schema offset 0x6e0).
 // В текущем libclient.so материал воды выбирается в одном месте:
-//   55a9490: 48 63 96 e0 06 00 00   movslq 0x6e0(%rsi),%rdx
-//   55a9497: 48 8d 05 ...           lea    table,%rax
-//   55a949e: 48 8b 34 d0            mov    (%rax,%rdx,8),%rsi
+//   55a9690: 48 63 96 e0 06 00 00   movslq 0x6e0(%rsi),%rdx
+//   55a9697: 48 8d 05 ...           lea    table,%rax
+//   55a969e: 48 8b 34 d0            mov    (%rax,%rdx,8),%rsi
 //
 // Патчим чтение поля на константу:
 //   48 63 96 e0 06 00 00 -> BA <id> 00 00 00 90 90
+//
+// Сигнатура для re-find после апдейта (movslq+lea+mov, уникальна в .text):
+//   48 63 96 e0 06 00 00 48 8d 05 ?? ?? ?? ?? 48 8b 34 d0
 class RiverManager {
-    static constexpr uintptr_t SITE_VADDR = 0x55a9490;
+    static constexpr uintptr_t SITE_VADDR = 0x55a9690;
     static const std::vector<uint8_t>& origBytes();
     static std::vector<uint8_t> makePatch(int riverId);
 
