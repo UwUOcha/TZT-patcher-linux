@@ -11,10 +11,14 @@ using namespace ansi;
 const std::vector<PlusManager::Site>& PlusManager::table() {
     //   8B 40 2C = mov eax,[rax+0x2c]  -> 6A 01 58 = push 1; pop rax
     //   8B 50 2C = mov edx,[rax+0x2c]  -> 6A 01 5A = push 1; pop rdx
+    // Сигнатуры для re-find после апдейта (каждая уникальна в .text):
+    //   #1: 8b 40 2c 45 31 f6 85 c0 41 0f 95 c6 48 8d 35 ?? ?? ?? ?? 4c 89 ef e8
+    //   #2: 8b 40 2c 4c 8d 65 d0 83 f8 02 0f 84 ?? ?? ?? ?? 83 f8 01 0f 84
+    //   #3: 8b 50 2c 85 d2 0f 85 ?? ?? ?? ?? 41 bc 02 00 00 00 eb
     static const std::vector<Site> t = {
-        { 0x62107e9, { 0x8b, 0x40, 0x2c }, { 0x6a, 0x01, 0x58 } },
-        { 0x651a926, { 0x8b, 0x40, 0x2c }, { 0x6a, 0x01, 0x58 } },
-        { 0x6897a47, { 0x8b, 0x50, 0x2c }, { 0x6a, 0x01, 0x5a } },
+        { 0x6210929, { 0x8b, 0x40, 0x2c }, { 0x6a, 0x01, 0x58 } },
+        { 0x651aa66, { 0x8b, 0x40, 0x2c }, { 0x6a, 0x01, 0x58 } },
+        { 0x6897c87, { 0x8b, 0x50, 0x2c }, { 0x6a, 0x01, 0x5a } },
     };
     return t;
 }
