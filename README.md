@@ -35,4 +35,4 @@ make
 ```
 
 This project also has documentation in:
-- [Русский](README.ru.md) (outdated)
+- [Русский](README.ru.md)
