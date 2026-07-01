@@ -241,12 +241,10 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
     const auto regions = mem.memoryRegions();
     std::vector<MemoryRegion> clientRegions;
     std::vector<MemoryRegion> dataRegions;
-    uintptr_t libBase = 0; // база загрузки libclient.so (минимальный mapped-адрес = ELF vaddr 0)
 
     for (const auto& region : regions) {
         if (region.path.find("libclient.so") != std::string::npos ||
             region.path.find("client.dll") != std::string::npos) {
-            if (libBase == 0 || region.start < libBase) libBase = region.start;
             if (region.perms.find('x') != std::string::npos) clientRegions.push_back(region);
             else if (region.perms.find("rw") != std::string::npos) dataRegions.push_back(region);
         }
@@ -259,10 +257,17 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
     PlusManager plusMgr;
     CameraManager camera(mem, dataRegions, [&](uintptr_t addr) { weatherMgr.persistCamera(addr); });
 
+    // Dota Plus читается один раз во время раннего GC/UI init. Если он выбран при
+    // запуске, находим и ставим этот патч ПЕРЕД всеми тяжёлыми сигнатурными
+    // сканами остальных модулей. Dota останавливается только на короткую запись.
+    if (launchedByUs && sel.dotaPlus)
+        plusMgr.scanAndEnableEarly(mem, clientRegions);
+    else
+        plusMgr.scan(mem, clientRegions);
+
     weatherMgr.scan(mem, clientRegions);
     particlesMgr.scan(mem, clientRegions);
-    riverMgr.scan(mem, libBase);
-    plusMgr.scan(mem, libBase); // Dota Plus патчит фиксированные vaddr = libBase + offset
+    riverMgr.scan(mem, clientRegions);
 
     // Восстановление адреса камеры из файла состояния той же сессии Dota.
     if (const uintptr_t rc = weatherMgr.recoveredCameraAddr()) {
@@ -283,20 +288,23 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
     // Dota Plus (client-side) патчит ЧТЕНИЕ статуса подписки — это нужно поставить
     // ДО GC-логина, чтобы welcome/UI открылись уже как Plus.
     if (launchedByUs && sel.dotaPlus) {
-        if (plusMgr.isFound() && !plusMgr.isEnabled(mem))
-            plusMgr.enable(mem);
-        else if (!plusMgr.isFound())
-            std::cout << YELLOW << "[!] Dota Plus selected, but status-read sites not verified "
-                      << "(game updated? re-find vaddr as in eternal_plus_extern.py)." << RESET << "\n";
+        if (!plusMgr.isFound())
+            std::cout << YELLOW << "[!] Dota Plus selected, but status-read sites not found "
+                      << "(game updated a lot? refresh the mov[rax+0x2c] signatures)." << RESET << "\n";
+        else if (!plusMgr.isComplete())
+            std::cout << RED << "[!] Dota Plus early patch found only "
+                      << plusMgr.siteCount() << "/3 status sites; refusing to report it as ON."
+                      << RESET << "\n";
+        else if (!plusMgr.isEnabled(mem))
+            std::cout << RED << "[!] Dota Plus early patch was incomplete; refusing to report it as ON."
+                      << RESET << "\n";
     }
 
-    console::pause("\nPress Enter to continue...");
+    console::waitForEnter("\nPress Enter to continue...");
 
     bool running = true;
     while (running) {
         printBanner();
-
-        const bool weatherNeedsCalib = !weatherMgr.isLocked() && weatherMgr.hasCandidates();
 
         // ── Статус ──
         statusRow(GREEN, "Dota 2   ",
@@ -314,8 +322,6 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
             v << GREEN << "ready" << RESET << GRAY << "  offset 0x"
               << std::hex << weatherMgr.offset() << std::dec << RESET;
             statusRow(GREEN, "Weather  ", v.str());
-        } else if (weatherMgr.hasCandidates()) {
-            statusRow(YELLOW, "Weather  ", YELLOW + "needs calibration" + RESET);
         } else {
             statusRow(RED, "Weather  ", RED + "not found" + RESET);
         }
@@ -359,13 +365,7 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
 
         // ── Сервисные действия ──
         std::cout << "   " << GRAY << "[c] relink camera (if already zoomed)" << RESET << "\n";
-        std::cout << "   ";
-        if (weatherNeedsCalib)
-            std::cout << BOLD << YELLOW << "[t]" << RESET << YELLOW << " Recalibrate weather" << RESET
-                      << YELLOW << "  ← do this first" << RESET;
-        else
-            std::cout << GRAY << "[t] recalibrate weather" << RESET;
-        std::cout << GRAY << "   ·   [0] exit" << RESET << "\n";
+        std::cout << "   " << GRAY << "[0] exit" << RESET << "\n";
         std::cout << console::divider();
         std::cout << "\n   " << CYAN << "❯ " << RESET;
 
@@ -431,44 +431,6 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
             if (std::cin >> id) riverMgr.applyRiver(mem, id);
             else { console::flushLine(); std::cout << RED << "Bad input." << RESET << "\n"; }
             console::pause();
-        } else if (cmd == "t" || cmd == "T") {
-            auto offsets = weatherMgr.trialOffsets();
-            if (offsets.empty()) {
-                std::cout << RED << "[!] No candidate offsets near baseline to try." << RESET << "\n";
-            } else {
-                constexpr int TEST_WEATHER = 1;
-                std::cout << "\n" << BOLD << "Auto-tune offset" << RESET << "\n"
-                          << "The tool applies a visible weather (Snow) for each candidate offset.\n"
-                          << "Watch the game and answer y (yes) / n (no) / q (stop).\n"
-                          << YELLOW << "Enter a match or demo where sky/ground is visible before starting.\n" << RESET
-                          << "Candidates near baseline: " << offsets.size() << "\n";
-                std::cout << "Press Enter to start...";
-                console::flushLine();
-
-                bool found = false;
-                for (const uint32_t off : offsets) {
-                    const int n = weatherMgr.applyAt(mem, off, TEST_WEATHER);
-                    std::cout << "\n[*] Offset 0x" << std::hex << off << std::dec
-                              << " — patched at " << n << " sites.\n";
-                    std::cout << CYAN << "    Did weather CHANGE in game? (y/n/q): " << RESET;
-                    std::string ans; std::cin >> ans;
-                    if (ans == "y" || ans == "Y") {
-                        weatherMgr.lock(off);
-                        std::cout << GREEN << "[+] Offset 0x" << std::hex << off << std::dec
-                                  << " confirmed! Use [2] to change weather now." << RESET << "\n";
-                        std::cout << YELLOW << "    Update HINT_OFFSET = 0x" << std::hex << off << std::dec
-                                  << " in the source so it's tried first next time." << RESET << "\n";
-                        found = true;
-                        break;
-                    }
-                    weatherMgr.revert(mem);
-                    if (ans == "q" || ans == "Q") break;
-                }
-                if (!found)
-                    std::cout << RED << "\n[!] No nearby offset worked. "
-                                        "Increase TRIAL_WINDOW or search in Binary Ninja." << RESET << "\n";
-            }
-            console::pause();
         } else if (cmd == "3") {
             particlesMgr.toggle(mem);
             console::pause();
@@ -525,17 +487,16 @@ pid_t App::runLaunchScreen(LaunchSelection& sel) {
                 pauseAfterHotkey();
                 continue;
             }
-            // Код-патч требует загруженной libclient.so. Если выбран мод — дождёмся её.
-            // Для Dota Plus патчим как можно РАНЬШE (до GC-логина), init-пауза короткая.
+            // Код-патч требует executable-сегмент libclient.so. Как только он
+            // появился, сразу переходим к раннему Dota Plus patch-path.
             if (sel.particles || sel.dotaPlus) {
                 if (!launcher::waitForClientLib(pid)) {
                     std::cout << YELLOW << "[!] libclient.so not loaded — mods can be enabled manually from the menu.\n" << RESET;
                     sel = LaunchSelection{};
                 } else {
-                    std::cout << "[*] Waiting for init (patching before GC login)...";
-                    std::cout.flush();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-                    std::cout << " done.\n";
+                    std::cout << "[*] libclient.so executable mapping ready";
+                    if (sel.dotaPlus) std::cout << " — installing Dota Plus patch immediately";
+                    std::cout << ".\n";
                 }
             }
             return pid;

@@ -47,7 +47,7 @@ class ParticlesManager {
     State loadState() const;
 
 public:
-    bool isFound() const { return sites_.size() == signatures().size(); }
+    bool isFound() const { return !sites_.empty(); }
     size_t siteCount() const { return sites_.size(); }
 
     // Патч включён, если на первом сайте стоит наш `mov eax,1` (0xB8).

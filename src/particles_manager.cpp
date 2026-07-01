@@ -14,17 +14,23 @@ const std::vector<uint8_t>& ParticlesManager::patchBytes() {
 }
 
 const std::vector<std::string>& ParticlesManager::signatures() {
+    // Два FoW-хелпера видимости, которые дёргает per-frame particle-cull перед
+    // SetRenderingEnabled(bool): большие эффекты → IsPointVisible(x,y,z), мелкие →
+    // box-visibility(&p1,&p2). Оба читают один набор FoW-grid глобалов и возвращают
+    // bool в eax. Форс обоих в `mov eax,1; ret` = каждая точка «видима» → эффект
+    // рендерится сквозь туман. Сигнатуры = ВХОД каждой функции (адрес = патч-сайт);
+    // уникальны в .text. Старый якорь-хеш 0x6b4ed927 Valve убрала — держим прологи.
     static const std::vector<std::string> s = {
-        // IsPointVisible(x@xmm0, y@xmm1, z@xmm2) -> bool
-        "55 31 C9 31 F6 BA 27 D9 4E 6B 48 89 E5 53 48 89 FB",
-        // box-visibility(&p1, &p2) -> bool
-        "55 31 C9 48 89 E5 41 55 49 89 D5 BA 27 D9 4E 6B 41 54 49 89 F4",
+        // IsPointVisible(x,y@xmm0, z@xmm1) -> bool
+        "55 48 89 E5 48 83 EC 10 8B 35 ?? ?? ?? ?? 66 0F D6 45 F0 F3 0F 11 4D F8",
+        // box-visibility(&p1, &p2) -> bool  (sibling, тот же FoW-grid набор)
+        "44 8B 05 ?? ?? ?? ?? 45 85 C0 0F 84 ?? ?? ?? ?? F7 05 ?? ?? ?? ?? FF FF FF 7F",
     };
     return s;
 }
 
 void ParticlesManager::saveState() const {
-    if (sites_.size() != signatures().size()) return;
+    if (sites_.empty()) return;
     std::ofstream f(STATE_PATH, std::ios::trunc);
     if (!f) return;
     f << "base " << std::hex << moduleBase_ << "\n";
@@ -51,7 +57,7 @@ ParticlesManager::State ParticlesManager::loadState() const {
             st.sites.push_back(std::move(s));
         }
     }
-    st.valid = (st.base != 0 && st.sites.size() == signatures().size());
+    st.valid = (st.base != 0 && !st.sites.empty());
     return st;
 }
 
@@ -88,20 +94,22 @@ void ParticlesManager::scan(const ProcessMemory& mem, const std::vector<MemoryRe
             sites_.push_back(std::move(s));
     }
 
-    if (isFound()) {
-        saveState();
-        std::cout << CYAN << "[*] Particles: both FoW gates located — [p] to reveal fog particles."
-                  << RESET << "\n";
-    } else if (sites_.empty()) {
+    // Патчим что нашли: оба хелпера дают полное вскрытие (крупные эффекты —
+    // IsPointVisible, мелкие — box-visibility), но и один лучше нуля. Не гейтим
+    // фичу на «найдены оба» — так одна протухшая сигнатура не убивает reveal.
+    if (sites_.empty()) {
         std::cout << YELLOW << "[!] Particle FoW gates not found "
-                  << "(game updated? refresh signatures from Binary Ninja)." << RESET << "\n";
-    } else {
-        // Нужны ОБА хелпера: мелкие эффекты идут через box-visibility, крупные —
-        // через IsPointVisible. С одним патч не вскроет всё, поэтому отключаем.
-        sites_.clear();
-        std::cout << YELLOW << "[!] Only one particle gate found — need both, patch disabled."
-                  << RESET << "\n";
+                  << "(game updated a lot? refresh the visibility-helper signatures)." << RESET << "\n";
+        return;
     }
+    saveState();
+    if (sites_.size() == signatures().size())
+        std::cout << CYAN << "[*] Particles: both FoW gates located."
+                  << RESET << "\n";
+    else
+        std::cout << YELLOW << "[*] Particles: " << sites_.size() << "/" << signatures().size()
+                  << " FoW gates located (some signatures stale — partial reveal)."
+                  << RESET << "\n";
 }
 
 void ParticlesManager::toggle(const ProcessMemory& mem) {

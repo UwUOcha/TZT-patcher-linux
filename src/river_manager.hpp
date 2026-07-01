@@ -1,32 +1,52 @@
 #pragma once
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "process_memory.hpp"
 
-// RiverManager — смена типа реки (River Vials) внешним патчем одной инструкции.
+// ─────────────────────────────────────────────────────────────────────────────
+//  RiverManager — смена типа реки (River Vials) внешним патчем одной инструкции.
 //
-// Тип реки — netvar m_nRiverType на C_DOTAGamerules (schema offset 0x6e0).
-// В текущем libclient.so материал воды выбирается в одном месте:
-//   55a9690: 48 63 96 e0 06 00 00   movslq 0x6e0(%rsi),%rdx
-//   55a9697: 48 8d 05 ...           lea    table,%rax
-//   55a969e: 48 8b 34 d0            mov    (%rax,%rdx,8),%rsi
+//  Тип реки — netvar m_nRiverType на C_DOTAGamerules. Материал воды выбирается в
+//  одном месте libclient.so:
+//    movslq disp(%rsi),%rdx        48 63 96 <disp32>     ; читаем m_nRiverType
+//    lea    table(%rip),%rax       48 8d 05 <rel32>
+//    mov    (%rax,%rdx,8),%rsi     48 8b 34 d0           ; выбираем материал
 //
-// Патчим чтение поля на константу:
-//   48 63 96 e0 06 00 00 -> BA <id> 00 00 00 90 90
+//  Патчим чтение поля на константу:
+//    48 63 96 <disp32>  ->  BA <id> 00 00 00 90 90       ; mov edx,id ; nop nop
 //
-// Сигнатура для re-find после апдейта (movslq+lea+mov, уникальна в .text):
-//   48 63 96 e0 06 00 00 48 8d 05 ?? ?? ?? ?? 48 8b 34 d0
+//  Адрес НЕ прибит к фиксированному vaddr — он находится сигнатурным сканом, чтобы
+//  патч переживал апдейты Доты без ручного перепоиска. disp32 в сигнатуре —
+//  wildcard: тогда сдвиг самого schema-оффсета m_nRiverType тоже переживём, а не
+//  только сдвиг бинаря. Уникальность держат lea(%rip)+индексная загрузка в %rsi:
+//    48 63 96 ?? ?? 00 00 48 8d 05 ?? ?? ?? ?? 48 8b 34 d0
+//
+//  Состояние (адрес+оригинал) пишется в /tmp — рестарт тулзы в той же сессии Доты
+//  подхватывает сайт, даже когда код уже затёрт нашим патчем и сигнатура не ищется.
+// ─────────────────────────────────────────────────────────────────────────────
 class RiverManager {
-    static constexpr uintptr_t SITE_VADDR = 0x55a9690;
-    static const std::vector<uint8_t>& origBytes();
+    // movslq-инструкция чтения m_nRiverType: 7 байт, которые мы перезаписываем.
+    static constexpr size_t SITE_LEN = 7;
+
+    // Сигнатура movslq+lea+mov с wildcard-нутым disp32 (уникальна в .text).
+    static const std::string& signature();
     static std::vector<uint8_t> makePatch(int riverId);
 
-    uintptr_t libBase_ = 0;
+    uintptr_t siteAddr_ = 0;              // абсолютный адрес movslq (найден сканом)
+    std::vector<uint8_t> orig_;           // оригинальные 7 байт movslq
+    uintptr_t moduleBase_ = 0;            // база exec-региона libclient (ключ сессии)
     bool scanned_ = false;
     bool verified_ = false;
 
+    const std::string STATE_PATH = "/tmp/dota_river_patch.state";
+
     bool readSite(const ProcessMemory& mem, std::vector<uint8_t>& out) const;
+
+    void saveState() const;
+    struct State { bool valid = false; uintptr_t base = 0; uintptr_t addr = 0; std::vector<uint8_t> orig; };
+    State loadState() const;
 
 public:
     static constexpr int RIVER_COUNT = 8; // 0..7
@@ -34,6 +54,6 @@ public:
     bool isFound() const { return verified_; }
     int currentId(const ProcessMemory& mem) const;
 
-    void scan(const ProcessMemory& mem, uintptr_t base);
+    void scan(const ProcessMemory& mem, const std::vector<MemoryRegion>& regions);
     void applyRiver(const ProcessMemory& mem, int riverId);
 };
