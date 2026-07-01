@@ -111,20 +111,25 @@ pid_t launchAndWaitForDota() {
 }
 
 bool waitForClientLib(pid_t pid, int timeoutSec) {
-    std::cout << "[*] Waiting for libclient.so";
+    std::cout << "[*] Waiting for executable libclient.so";
     std::cout.flush();
-    for (int i = 0; i < timeoutSec * 2; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    constexpr int POLL_MS = 25;
+    const int attempts = timeoutSec * 1000 / POLL_MS;
+    for (int i = 0; i < attempts; ++i) {
         const std::string mapsPath = "/proc/" + std::to_string(pid) + "/maps";
         std::ifstream f(mapsPath);
         std::string line;
         while (std::getline(f, line)) {
-            if (line.find("libclient.so") != std::string::npos) {
+            // Одного read-only ELF mapping недостаточно: сигнатуры и патч-сайты
+            // живут в .text. Возвращаемся ровно при появлении executable mapping.
+            if (line.find("libclient.so") != std::string::npos &&
+                line.find("r-x") != std::string::npos) {
                 std::cout << "\n";
                 return true;
             }
         }
-        if (i % 4 == 0) { std::cout << "."; std::cout.flush(); }
+        if (i % (2000 / POLL_MS) == 0) { std::cout << "."; std::cout.flush(); }
+        std::this_thread::sleep_for(std::chrono::milliseconds(POLL_MS));
     }
     std::cout << "\n" << RED << "[!] Timeout waiting for libclient.so." << RESET << "\n";
     return false;

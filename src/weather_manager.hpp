@@ -6,32 +6,32 @@
 #include "process_memory.hpp"
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  WeatherManager — смена погоды в Dota патчем инструкций чтения поля [RBX+disp].
+//  WeatherManager — смена погоды в Dota патчем инструкций чтения поля погоды.
 //
-//  По одним байтам поле погоды от других полей не отличить, поэтому единственный
-//  надёжный критерий правильного смещения — реально ли поменялась погода в игре.
-//  Калибровка ([t] в UI) перебирает кандидатов вокруг HINT_OFFSET и подтверждает
-//  рабочий по глазам пользователя.
+//  Тип погоды — целое поле на объекте погоды (this+offset), которое клиент читает
+//  и по нему выбирает частицы/освещение. Форсим эти чтения в константу → погода.
+//
+//  АВТОПОИСК (главный путь): оффсет находится СЕМАНТИЧЕСКИ, без ручной калибровки.
+//  Якорь — уникальный идиом функции применения погоды:
+//      movslq off(%rdi),%rax        ; читаем тип погоды
+//      mov    edx, <N>              ; клэмп к числу типов погоды
+//      cmp/cmovg/xor/test/cmovs     ; clamp [0,N]
+//      lea    weather_particle_table(%rip),%rdx
+//      mov    (%rdx,%rax,8), r64    ; particles/rain_fx/econ_*.vpcf по типу
+//  Из movslq читаем disp32 = оффсет типа погоды. Затем патчим ВСЕ чтения этого
+//  поля (movsxd/mov/movzbl, любой базовый регистр) в "mov <dest>, id".
 // ─────────────────────────────────────────────────────────────────────────────
 class WeatherManager {
-    // Одно совпадение инструкции, читающей поле [RBX+disp].
-    struct Hit {
-        uintptr_t address;
-        std::string type;   // "Particles" (movsxd) или "Lighting" (mov)
-        uint32_t disp;      // реальное смещение, прочитанное из инструкции
-        size_t size;        // длина инструкции (сколько байт перезаписываем)
-    };
-
-    // Место патча: адрес инструкции + её ОРИГИНАЛЬНЫЕ байты (чтобы вернуть как было).
+    // Место патча: адрес инструкции + ОРИГИНАЛ + опкод "mov <dest>,imm32" (0xB8+reg),
+    // чтобы патч писал константу в ТОТ ЖЕ регистр-приёмник, что и оригинал.
     struct PatchSite {
         uintptr_t address;
         size_t size;
         std::vector<uint8_t> original;
+        uint8_t movOpcode = 0xB8;   // 0xB8+destReg (mov r32, imm32)
     };
 
-    std::vector<Hit> allHits_;        // все найденные чтения [RBX+small]
     std::vector<PatchSite> sites_;    // подтверждённые места патча (+оригиналы)
-    std::vector<PatchSite> backup_;   // оригиналы текущего НЕподтверждённого пробного патча
     uintptr_t moduleBase_ = 0;        // база exec-региона libclient (ключ сессии)
     uint32_t resolvedOffset_ = 0;     // подтверждённый оффсет погоды
     bool isScanned_ = false;
@@ -47,28 +47,29 @@ class WeatherManager {
     const std::string STATE_PATH = "/tmp/dota_weather_patch.state";
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  HINT_OFFSET — последний РАБОЧИЙ оффсет погоды. Перебор идёт от кандидатов,
-    //  ближайших к этому числу. Когда подтвердишь новый оффсет — впиши его сюда,
-    //  чтобы в следующий раз перебор начинался прямо с него.
+    //  Якорь применения погоды. movslq disp32 (любой базовый регистр) + клэмп
+    //  (mov edx,<N> — число погод, wildcard) + lea таблицы econ-частиц. disp32
+    //  типа погоды читается по смещению ANCHOR_DISP_POS от начала совпадения.
     // ─────────────────────────────────────────────────────────────────────────
-    static constexpr uint32_t HINT_OFFSET  = 0xAD4;
+    static const std::string& applyAnchor();
+    static constexpr size_t ANCHOR_DISP_POS = 3;
+
+    // Формы чтения поля погоды, которые умеем патчить (префикс до modrm).
+    struct ReadForm { std::string name; std::vector<uint8_t> prefix; };
+    static const std::vector<ReadForm>& readForms();
+
     static constexpr uint32_t MIN_OFFSET   = 0x100;  // нижняя граница разумного смещения
     static constexpr uint32_t MAX_OFFSET   = 0x4000; // верхняя граница разумного смещения
-    static constexpr uint32_t TRIAL_WINDOW = 0x80;   // насколько далеко от HINT перебираем
 
-    struct PatternDef {
-        std::string name;
-        std::string opcodePrefix; // байты инструкции ДО 32-битного смещения
-    };
-    static const std::vector<PatternDef>& patterns();
+    // Байты патча "mov <dest>, id" + NOP-добивка до длины инструкции.
+    static std::vector<uint8_t> makePatch(int weatherId, size_t size, uint8_t movOpcode);
 
-    static uint32_t absDiff(uint32_t a, uint32_t b) { return a > b ? a - b : b - a; }
-
-    // Байты патча "mov eax, id" + NOP-добивка до длины инструкции.
-    static std::vector<uint8_t> makePatch(int weatherId, size_t size);
-
-    std::vector<const Hit*> hitsForOffset(uint32_t offset) const;
-    std::vector<PatchSite> captureSites(const ProcessMemory& mem, uint32_t offset) const;
+    // Автопоиск: найти оффсет погоды по якорю (0 = не найден).
+    uint32_t findWeatherOffset(const ProcessMemory& mem, const std::vector<MemoryRegion>& regions) const;
+    // Захватить все патч-сайты (movsxd/mov/movzbl [base+offset]) для оффсета.
+    std::vector<PatchSite> captureFieldSites(const ProcessMemory& mem,
+                                             const std::vector<MemoryRegion>& regions,
+                                             uint32_t offset) const;
 
     void saveState() const;
 
@@ -89,23 +90,9 @@ public:
     void persistCamera(uintptr_t addr);
 
     uint32_t offset() const { return resolvedOffset_; }
-    bool hasCandidates() const { return !allHits_.empty(); }
     bool isLocked() const { return locked_; }
 
     void scan(const ProcessMemory& mem, const std::vector<MemoryRegion>& regions);
-
-    // Уникальные смещения в окне вокруг HINT, отсортированные по близости к нему.
-    std::vector<uint32_t> trialOffsets() const;
-
-    // Пробно запатчить все инструкции с данным смещением, сохранив оригиналы в backup.
-    int applyAt(const ProcessMemory& mem, uint32_t offset, int weatherId);
-
-    // Вернуть оригинальные байты последнего пробного патча.
-    void revert(const ProcessMemory& mem);
-
-    // Зафиксировать найденный оффсет как рабочий: пробные оригиналы становятся
-    // постоянными местами патча, состояние пишется в файл.
-    void lock(uint32_t offset);
 
     // Смена погоды по подтверждённому оффсету. id == 0 (Default) ВОССТАНАВЛИВАЕТ
     // оригинальный код, а не пишет ноль: погода становится настоящей дефолтной.

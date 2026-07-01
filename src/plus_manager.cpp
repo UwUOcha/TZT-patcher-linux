@@ -1,83 +1,133 @@
 #include "plus_manager.hpp"
 
-#include <chrono>
 #include <iostream>
-#include <thread>
 
 #include "ansi.hpp"
 
 using namespace ansi;
 
-const std::vector<PlusManager::Site>& PlusManager::table() {
-    //   8B 40 2C = mov eax,[rax+0x2c]  -> 6A 01 58 = push 1; pop rax
-    //   8B 50 2C = mov edx,[rax+0x2c]  -> 6A 01 5A = push 1; pop rdx
-    // Сигнатуры для re-find после апдейта (каждая уникальна в .text):
-    //   #1: 8b 40 2c 45 31 f6 85 c0 41 0f 95 c6 48 8d 35 ?? ?? ?? ?? 4c 89 ef e8
-    //   #2: 8b 40 2c 4c 8d 65 d0 83 f8 02 0f 84 ?? ?? ?? ?? 83 f8 01 0f 84
-    //   #3: 8b 50 2c 85 d2 0f 85 ?? ?? ?? ?? 41 bc 02 00 00 00 eb
-    static const std::vector<Site> t = {
-        { 0x6210929, { 0x8b, 0x40, 0x2c }, { 0x6a, 0x01, 0x58 } },
-        { 0x651aa66, { 0x8b, 0x40, 0x2c }, { 0x6a, 0x01, 0x58 } },
-        { 0x6897c87, { 0x8b, 0x50, 0x2c }, { 0x6a, 0x01, 0x5a } },
+const std::vector<std::string>& PlusManager::signatures() {
+    // Ядро каждого сайта: чтение статуса [rax+0x2c] + начало ветвления по нему.
+    // Волатильный хвост (rel32/окружающий код) НЕ включён — он и ломается при
+    // рекомпиляции. Каждое ядро уникально в .text (проверено на текущем бинаре):
+    //   #1  mov eax,[rax+0x2c] ; xor r14d,r14d ; test eax,eax
+    //       → Panorama property "IsPlusMember"
+    //   #2  mov eax,[rax+0x2c] ; lea r12,[rbp-0x30] ; cmp eax,2/1
+    //       → "PlusPrepaid" / "PlusRenewal"
+    //   #3  mov edx,[rax+0x2c] ; test edx,edx ; je ; cmp edx,2/1
+    //       → обновление локального кеша Plus из того же status getter
+    //
+    // Live-проверка 2026-07-01, md5 12247b9f14d3: vaddr 0x63fd449,
+    // 0x6706f26, 0x6ac496c. Эти числа — только диагностическая история:
+    // runtime использует сигнатуры, а не vaddr.
+    static const std::vector<std::string> s = {
+        "8B 40 2C 45 31 F6 85 C0",
+        "8B 40 2C 4C 8D 65 D0",
+        "8B 50 2C 85 D2 74 ?? 83 FA 02 74 ?? 83 FA 01",
     };
-    return t;
+    return s;
 }
 
-bool PlusManager::readSite(const ProcessMemory& mem, const Site& s, std::vector<uint8_t>& out) const {
-    return mem.readBytes(libBase_ + s.vaddr, s.orig.size(), out);
+std::vector<uint8_t> PlusManager::patchFor(const std::vector<uint8_t>& orig) {
+    // mov reg,[rax+0x2c] → push 1 ; pop reg. reg берём из поля reg байта ModRM.
+    if (orig.size() != 3 || orig[0] != 0x8B || orig[2] != 0x2C ||
+        (orig[1] & 0xC7) != 0x40)
+        return {};
+    const uint8_t reg = (orig[1] >> 3) & 0x07;
+    return { 0x6A, 0x01, static_cast<uint8_t>(0x58 + reg) };
 }
 
 bool PlusManager::isEnabled(const ProcessMemory& mem) const {
-    if (!verified_) return false;
-    std::vector<uint8_t> buf;
-    return readSite(mem, table().front(), buf) && !buf.empty() && buf[0] == 0x6A;
+    if (!isComplete()) return false;
+    for (const auto& s : sites_) {
+        std::vector<uint8_t> cur;
+        if (!mem.readBytes(s.addr, s.patch.size(), cur) || cur != s.patch)
+            return false;
+    }
+    return true;
 }
 
-void PlusManager::scan(const ProcessMemory& mem, uintptr_t base) {
+void PlusManager::scan(const ProcessMemory& mem, const std::vector<MemoryRegion>& regions) {
     if (scanned_) return;
     scanned_ = true;
-    libBase_ = base;
-    if (libBase_ == 0) {
-        std::cout << RED << "[!] Dota Plus: libclient base unknown — cannot locate sites." << RESET << "\n";
+
+    const auto& sigs = signatures();
+
+    // waitForClientLib() пропускает нас только после появления executable mapping,
+    // поэтому повторные 250-ms циклы здесь не нужны: .text уже отображён целиком.
+    // Поиск идёт без остановки Dota; каждый сайт принимаем только при уникальном
+    // совпадении.
+    for (const auto& sigStr : sigs) {
+        const std::vector<int> sig = parsePattern(sigStr);
+        uintptr_t found = 0;
+        int matches = 0;
+        for (const auto& region : regions) {
+            for (const auto addr : findAllPatterns(mem, region, sig)) {
+                if (++matches == 1) found = addr;
+                if (matches > 1) break;
+            }
+            if (matches > 1) break;
+        }
+        if (matches != 1) continue;
+
+        Site st;
+        st.addr = found;
+        if (!mem.readBytes(found, 3, st.orig) || st.orig.size() != 3) continue;
+        st.patch = patchFor(st.orig);
+        if (!st.patch.empty()) sites_.push_back(std::move(st));
+    }
+
+    if (sites_.empty()) {
+        std::cout << YELLOW << "[!] Dota Plus: no status-read sites found "
+                  << "(game updated a lot? refresh the mov[rax+0x2c] core signatures)."
+                  << RESET << "\n";
         return;
     }
 
-    // .text мог ещё домапливаться (как retry-цикл в .py). Сайт валиден, если
-    // читается как оригинал ЛИБО как наш патч (уже включён в этой сессии).
-    bool allOk = false;
-    for (int attempt = 0; attempt < 8 && !allOk; ++attempt) {
-        allOk = true;
-        for (const auto& s : table()) {
-            std::vector<uint8_t> cur;
-            if (!readSite(mem, s, cur) || (cur != s.orig && cur != s.patch)) {
-                allOk = false;
-                break;
-            }
-        }
-        if (!allOk) std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    }
-    verified_ = allOk;
+    std::cout << CYAN << "[*] Dota Plus: " << sites_.size() << "/" << sigs.size()
+              << " status-read sites located";
+    if (sites_.size() != sigs.size())
+        std::cout << YELLOW << " (some signatures stale — still patch what we have)" << CYAN;
+    std::cout << " (applied at launch)." << RESET << "\n";
+}
 
-    if (verified_)
-        std::cout << CYAN << "[*] Dota Plus: " << table().size()
-                  << " status-read sites verified (applied at launch)." << RESET << "\n";
+int PlusManager::writePatches(const ProcessMemory& mem) {
+    int n = 0;
+    for (const auto& s : sites_) {
+        std::vector<uint8_t> cur;
+        if (!mem.readBytes(s.addr, s.orig.size(), cur)) continue;
+        if (cur == s.patch) { n++; continue; }                  // уже стоит
+        if (cur != s.orig) continue;                            // чужие байты — не трогаем
+        if (mem.writeBytes(s.addr, s.patch)) n++;
+    }
+    return n;
+}
+
+void PlusManager::scanAndEnableEarly(const ProcessMemory& mem,
+                                     const std::vector<MemoryRegion>& regions) {
+    scan(mem, regions);
+    if (sites_.empty()) return;
+
+    // Сам сигнатурный поиск может занять заметное время и не требует остановки.
+    // SIGSTOP нужен лишь на короткую запись инструкций, чтобы исключить torn write.
+    mem.freeze();
+    const int n = writePatches(mem);
+    mem.unfreeze();
+
+    if (isComplete())
+        std::cout << GREEN << "[+] Dota Plus early patch installed before GC init ("
+                  << n << "/" << sites_.size() << " sites)." << RESET << "\n";
     else
-        std::cout << YELLOW << "[!] Dota Plus: status-read sites don't match "
-                  << "(game updated? re-find vaddr like in eternal_plus_extern.py)." << RESET << "\n";
+        std::cout << YELLOW << "[!] Dota Plus early patch is partial ("
+                  << n << "/" << signatures().size()
+                  << " sites); it will not be reported as ON." << RESET << "\n";
 }
 
 void PlusManager::enable(const ProcessMemory& mem) {
-    if (!verified_ || isEnabled(mem)) return;
+    if (sites_.empty()) return;
     mem.freeze();
-    int n = 0;
-    for (const auto& s : table()) {
-        std::vector<uint8_t> cur;
-        if (!readSite(mem, s, cur)) continue;
-        if (cur == s.patch) { n++; continue; }                  // уже стоит
-        if (cur != s.orig) continue;                            // чужие байты — не трогаем
-        if (mem.writeBytes(libBase_ + s.vaddr, s.patch)) n++;
-    }
+    const int n = writePatches(mem);
     mem.unfreeze();
     std::cout << GREEN << "[+] Dota Plus ON (client-side) — status reads forced to Active at launch ("
-              << n << "/" << table().size() << " sites)!" << RESET << "\n";
+              << n << "/" << sites_.size() << " sites)!" << RESET << "\n";
 }
