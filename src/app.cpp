@@ -163,6 +163,19 @@ void pauseAfterHotkey(const std::string& msg = "\nPress Enter to return...") {
 
 } // namespace
 
+void App::printBanner() {
+    std::cout << "\033[2J\033[1;1H";
+
+    std::cout << CYAN << BOLD
+              << "╔════════════════════════════════════════════════════╗\n"
+              << "║                   TZT Patcher                      ║\n"
+              << "║        " << RESET << "Camera Distance & Weather Changer  " << CYAN << BOLD <<
+                 "         ║\n"
+              << "╚════════════════════════════════════════════════════╝"
+              << RESET
+              << "\n\n";
+}
+
 void App::printWeatherList() {
     struct WeatherItem {
         std::string color;

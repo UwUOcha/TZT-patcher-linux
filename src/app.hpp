@@ -23,6 +23,7 @@ private:
     // Главное меню по уже запущенной Dota.
     void runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launchedByUs);
 
+    static void printBanner();
     static void printWeatherList();
     static void printRiverList();
 };
