@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "process_memory.hpp"
@@ -52,7 +53,24 @@ class CameraManager {
     std::vector<Site> sites_;    // все места, откуда кеш перезаливается из конвара
     uintptr_t cacheAddr_ = 0;    // g_cameraSettings[0] — то, что читает рендер камеры
     uintptr_t convarAddr_ = 0;   // ConVarData+0x58 — ТОЛЬКО ЧТЕНИЕ (дефолт для Default)
+    uintptr_t moduleBase_ = 0;   // база libclient (ключ сессии Dota)
     bool scanned_ = false;
+
+    // Файл состояния: после нашего патча инструкции записи в кеш затёрты NOP'ами,
+    // и повторный запуск проги себя уже не найдёт. Поэтому в рамках одной сессии
+    // Dota (совпала база модуля) адреса и оригиналы подхватываются отсюда —
+    // ровно как это делают river/particles/weather.
+    const std::string STATE_PATH = "/tmp/dota_camera_patch.state";
+
+    struct State {
+        bool valid = false;
+        uintptr_t base = 0;
+        uintptr_t cache = 0;
+        uintptr_t convar = 0;
+        std::vector<Site> sites;
+    };
+    void saveState() const;
+    State loadState() const;
 
     // CConVar<float> / ConVarData: смещения, добытые из кода клиента.
     static constexpr size_t CONVAR_DATA_PTR = 0x08;

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <string>
@@ -48,6 +50,43 @@ std::vector<uint8_t> CameraManager::nopOfSize(size_t size) {
     if (size == MOVLPS_LEN) return { 0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00 };
     if (size == MOVSS_LEN)  return { 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 };
     return {};
+}
+
+void CameraManager::saveState() const {
+    if (cacheAddr_ == 0 || sites_.empty()) return;
+    std::ofstream f(STATE_PATH, std::ios::trunc);
+    if (!f) return;
+    f << "base " << std::hex << moduleBase_ << "\n";
+    f << "cache " << std::hex << cacheAddr_ << "\n";
+    f << "convar " << std::hex << convarAddr_ << "\n";
+    for (const auto& s : sites_) {
+        f << "site " << std::hex << s.addr << " ";
+        for (const uint8_t b : s.original)
+            f << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
+        f << "\n";
+    }
+}
+
+CameraManager::State CameraManager::loadState() const {
+    State st;
+    std::ifstream f(STATE_PATH);
+    if (!f) return st;
+    std::string tok;
+    while (f >> tok) {
+        if (tok == "base")        f >> std::hex >> st.base;
+        else if (tok == "cache")  f >> std::hex >> st.cache;
+        else if (tok == "convar") f >> std::hex >> st.convar;
+        else if (tok == "site") {
+            Site s;
+            std::string hex;
+            f >> std::hex >> s.addr >> hex;
+            for (size_t i = 0; i + 1 < hex.size(); i += 2)
+                s.original.push_back(static_cast<uint8_t>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+            st.sites.push_back(std::move(s));
+        }
+    }
+    st.valid = (st.base != 0 && st.cache != 0 && st.convar != 0 && !st.sites.empty());
+    return st;
 }
 
 float CameraManager::distance(const ProcessMemory& mem) const {
@@ -107,6 +146,19 @@ void CameraManager::scan(const ProcessMemory& mem, const std::vector<MemoryRegio
 
     if (exec.empty() || readOnly.empty() || writable.empty()) {
         std::cout << YELLOW << "[!] Camera: libclient.so mappings incomplete." << RESET << "\n";
+        return;
+    }
+    moduleBase_ = moduleBase;
+
+    // Та же сессия Dota: инструкции записи в кеш уже могли быть затёрты нашими
+    // NOP'ами, и тогда сканом их не найти — берём адреса и оригиналы из файла.
+    if (const State st = loadState(); st.valid && st.base == moduleBase_) {
+        cacheAddr_ = st.cache;
+        convarAddr_ = st.convar;
+        sites_ = st.sites;
+        std::cout << GREEN << "[+] Camera recovered from state (cache libclient+0x" << std::hex
+                  << (cacheAddr_ - moduleBase_) << std::dec << ", " << sites_.size()
+                  << " refresh sites) — distance " << distance(mem) << "." << RESET << "\n";
         return;
     }
 
@@ -236,6 +288,7 @@ void CameraManager::scan(const ProcessMemory& mem, const std::vector<MemoryRegio
     cacheAddr_ = best;
     convarAddr_ = dataPtr + CONVAR_VALUE;
     sites_ = std::move(byCache[best]);
+    saveState();
     std::cout << CYAN << "[*] Camera: resolved via dota_camera_distance (cache libclient+0x"
               << std::hex << (best - moduleBase) << std::dec << ", " << sites_.size()
               << " refresh sites) — distance " << cached << "." << RESET << "\n";
