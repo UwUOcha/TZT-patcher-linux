@@ -32,6 +32,19 @@ bool ProcessMemory::readBytes(uintptr_t address, size_t size, std::vector<uint8_
     return pread(memFd_, buffer.data(), size, address) == static_cast<ssize_t>(size);
 }
 
+bool ProcessMemory::readRegion(const MemoryRegion& region, std::vector<uint8_t>& buffer) const {
+    constexpr size_t CHUNK_SIZE = 0x100000; // 1MB
+    const size_t total = region.end - region.start;
+    buffer.assign(total, 0);
+    for (size_t done = 0; done < total;) {
+        const size_t want = std::min(CHUNK_SIZE, total - done);
+        const ssize_t got = pread(memFd_, buffer.data() + done, want, region.start + done);
+        if (got <= 0) return false;
+        done += static_cast<size_t>(got);
+    }
+    return true;
+}
+
 std::vector<MemoryRegion> ProcessMemory::memoryRegions() const {
     std::vector<MemoryRegion> regions;
     const std::string mapsPath = "/proc/" + std::to_string(pid_) + "/maps";
@@ -120,23 +133,4 @@ std::vector<uintptr_t> findAllPatterns(const ProcessMemory& mem, const MemoryReg
         }
     }
     return results;
-}
-
-uintptr_t scanForCameraAddress(const ProcessMemory& mem, const MemoryRegion& region, float targetDistance) {
-    if (region.perms.find('x') != std::string::npos) return 0;
-    constexpr size_t CHUNK_SIZE = 0x10000;
-    std::vector<uint8_t> buffer;
-
-    for (uintptr_t addr = region.start; addr < region.end - sizeof(float); addr += CHUNK_SIZE) {
-        const size_t readSize = std::min(CHUNK_SIZE, static_cast<size_t>(region.end - addr));
-        if (!mem.readBytes(addr, readSize, buffer)) continue;
-
-        for (size_t i = 0; i + sizeof(float) <= readSize; i += 4) {
-            float value;
-            memcpy(&value, &buffer[i], sizeof(float));
-            if (value >= targetDistance - 10 && value <= targetDistance + 10)
-                return addr + i;
-        }
-    }
-    return 0;
 }

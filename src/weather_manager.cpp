@@ -93,7 +93,6 @@ void WeatherManager::saveState() const {
     if (!f) return;
     f << "base " << std::hex << moduleBase_ << "\n";
     f << "offset " << std::hex << resolvedOffset_ << "\n";
-    f << "camera " << std::hex << persistedCamera_ << "\n";
     for (const auto& s : sites_) {
         f << "site " << std::hex << s.address << " " << std::dec << s.size << " "
           << std::hex << static_cast<int>(s.movOpcode) << " ";
@@ -111,7 +110,6 @@ WeatherManager::State WeatherManager::loadState() const {
     while (f >> tok) {
         if (tok == "base")        f >> std::hex >> st.base;
         else if (tok == "offset") f >> std::hex >> st.offset;
-        else if (tok == "camera") f >> std::hex >> st.cameraAddr;
         else if (tok == "site") {
             PatchSite s; std::string hex; int op = 0xB8;
             f >> std::hex >> s.address >> std::dec >> s.size >> std::hex >> op >> hex;
@@ -125,24 +123,14 @@ WeatherManager::State WeatherManager::loadState() const {
     return st;
 }
 
-void WeatherManager::persistCamera(uintptr_t addr) {
-    persistedCamera_ = addr;
-    saveState();
-}
-
 void WeatherManager::scan(const ProcessMemory& mem, const std::vector<MemoryRegion>& regions) {
     if (isScanned_) return;
     isScanned_ = true;
 
     if (!regions.empty()) moduleBase_ = regions.front().start;
 
-    // Файл состояния нужен и для камеры, и для погоды. Читаем один раз.
     const State st = loadState();
     const bool sameSession = (st.base != 0 && st.base == moduleBase_);
-    if (sameSession) {
-        persistedCamera_ = st.cameraAddr; // не потерять при последующих перезаписях файла
-        loadedCamera_    = st.cameraAddr; // отдать main для восстановления камеры
-    }
 
     // Случай 0 (та же сессия, код уже мог быть затёрт нашим патчем): восстановить
     // оффсет и места патча из файла — сигнатуры искать не нужно.

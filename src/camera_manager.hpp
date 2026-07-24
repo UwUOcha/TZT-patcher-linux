@@ -1,43 +1,93 @@
 #pragma once
 #include <cstdint>
-#include <functional>
 #include <vector>
 
 #include "process_memory.hpp"
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  CameraManager — поиск и изменение дистанции камеры в data-регионах libclient.
+//  CameraManager — дистанция камеры через РЕЗОЛВ ПО КОДУ, без скана по значению
+//  и БЕЗ записи в сам ConVar.
 //
-//  Дистанция хранится как float в rw-памяти. «Привязка» (link) — это скан региона
-//  на значение, близкое к искомому; найденный адрес запоминается и потом в него
-//  пишутся новые значения. Адрес отдаётся наружу через колбэк persist, чтобы
-//  WeatherManager сохранил его в общий файл состояния сессии.
+//  Как оно устроено в клиенте (RE libclient.so):
+//    • `dota_camera_distance` — обычный ConVar (флаги 0x4000 = CHEAT). Объект
+//      CConVar<float> в .bss: на +0x08 указатель на ConVarData, значение — float
+//      на ConVarData+0x58. ЭТО ЗНАЧЕНИЕ МЫ НЕ ТРОГАЕМ: конвар — штатная сущность,
+//      её значение клиент умеет отдавать наружу по запросу, в отличие от
+//      внутреннего кеша ниже. Читаем его только чтобы знать дефолт.
+//    • Клиент держит РАСПАКОВАННЫЙ кеш настроек камеры — массив float в .data:
+//          g_cameraSettings[0] = dota_camera_distance
+//          g_cameraSettings[1] = dota_camera_fov_max
+//          [2..5] = -1 (значит «не переопределено»)
+//    • Итоговый зум каждый кадр считается как
+//          lerp(dota_camera_distance_min, g_cameraSettings[0], t)
+//      то есть g_cameraSettings[0] — «максимальное отдаление».
+//    • Кеш перезаливается из конваров колбэком на изменение любого camera-конвара.
+//      Поэтому просто записать кеш мало — ближайший рефреш вернёт дефолт.
+//
+//  Отсюда механика: НОПИМ инструкции, которые пишут в g_cameraSettings[0]
+//  (`movss [rip+G],xmm0` / `movlps [rip+G],xmm0`), и пишем значение в кеш сами.
+//  Дальше клиент не может его перетереть. Это тот же класс воздействия, что уже
+//  используется для weather/river/particles/plus — патч кода, а не подмена
+//  штатного состояния игры. Default восстанавливает оригинальные байты и
+//  возвращает в кеш значение из ConVar.
+//
+//  Резолв — цепочка якорей, каждый из которых проверяет следующий:
+//    1) строка "dota_camera_distance" в r-- регионе libclient;
+//    2) ЕДИНСТВЕННЫЙ `lea rsi,[rip+str]` в .text — место регистрации ConVar;
+//    3) ближайший назад `lea rax,[rip+obj]`, obj в rw-памяти модуля → CConVar;
+//    4) в .text ищем читателей `mov rax,[rip+obj+8]` + `movss xmm0,[rax+0x58]`,
+//       за которыми идёт `movss/movlps [rip+G],xmm0` → G = g_cameraSettings[0],
+//       а сами эти store-инструкции и есть места патча.
+//  Принимаем G только при КОНСЕНСУСЕ ≥2 независимых сайтов. Не сошлось —
+//  считаем камеру ненайденной и НИЧЕГО не пишем: лучше «not found», чем запись
+//  в случайный float (ровно это и делал старый скан ±10 от 1200).
 // ─────────────────────────────────────────────────────────────────────────────
 class CameraManager {
-    const ProcessMemory& mem_;
-    const std::vector<MemoryRegion>& dataRegions_;
-    std::function<void(uintptr_t)> persist_;   // сохранить адрес в файл состояния
+    // Инструкция записи в g_cameraSettings[0] + её оригинальные байты.
+    struct Site {
+        uintptr_t addr = 0;
+        std::vector<uint8_t> original;
+    };
 
-    uintptr_t addr_ = 0;
-    float distance_ = DEFAULT_DISTANCE;
+    std::vector<Site> sites_;    // все места, откуда кеш перезаливается из конвара
+    uintptr_t cacheAddr_ = 0;    // g_cameraSettings[0] — то, что читает рендер камеры
+    uintptr_t convarAddr_ = 0;   // ConVarData+0x58 — ТОЛЬКО ЧТЕНИЕ (дефолт для Default)
+    bool scanned_ = false;
+
+    // CConVar<float> / ConVarData: смещения, добытые из кода клиента.
+    static constexpr size_t CONVAR_DATA_PTR = 0x08;
+    static constexpr size_t CONVAR_VALUE    = 0x58;
+
+    // Разумные границы для sanity-проверки найденного значения.
+    static constexpr float MIN_SANE = 100.0f;
+    static constexpr float MAX_SANE = 100000.0f;
+
+    // Многобайтовый NOP нужной длины (7 для movlps, 8 для movss).
+    static std::vector<uint8_t> nopOfSize(size_t size);
+
+    // Занопить/восстановить места перезаливки кеша. Возвращает число сайтов.
+    int writeSites(const ProcessMemory& mem, bool patched) const;
 
 public:
     static constexpr float DEFAULT_DISTANCE = 1200.0f;
 
-    CameraManager(const ProcessMemory& mem, const std::vector<MemoryRegion>& dataRegions,
-                  std::function<void(uintptr_t)> persist)
-        : mem_(mem), dataRegions_(dataRegions), persist_(std::move(persist)) {}
+    bool isLinked() const { return cacheAddr_ != 0 && !sites_.empty(); }
+    uintptr_t address() const { return cacheAddr_; }
 
-    bool isLinked() const { return addr_ != 0; }
-    uintptr_t address() const { return addr_; }
-    float distance() const { return distance_; }
+    // Текущая дистанция из кеша настроек камеры (0 если не привязаны).
+    float distance(const ProcessMemory& mem) const;
 
-    // Найти адрес дистанции рядом с dist и привязаться к нему.
-    bool linkAt(float dist);
+    // Кеш «залочен» нами — клиент не может перезалить его из конвара.
+    bool isForced(const ProcessMemory& mem) const;
 
-    // Привязка из восстановленного адреса (файл состояния прошлой сессии).
-    void linkRecovered(uintptr_t addr, float dist);
+    // Найти кеш и места его перезаливки. Полный список регионов нужен потому, что
+    // хвост .bss libclient ложится в АНОНИМНЫЙ rw-регион сразу за модулем — по
+    // имени модуля он не находится, а объект ConVar лежит именно там.
+    void scan(const ProcessMemory& mem, const std::vector<MemoryRegion>& allRegions);
 
-    // Записать новую дистанцию в привязанный адрес.
-    bool setDistance(float value);
+    // Залочить кеш и записать в него дистанцию.
+    bool setDistance(const ProcessMemory& mem, float value);
+
+    // Вернуть оригинальный код и значение конвара в кеш.
+    bool restoreDefault(const ProcessMemory& mem);
 };

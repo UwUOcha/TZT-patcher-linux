@@ -37,11 +37,6 @@ class WeatherManager {
     bool isScanned_ = false;
     bool locked_ = false;             // оффсет подтверждён/восстановлен
 
-    // Адрес дистанции камеры тоже хранится в общем файле состояния, чтобы после
-    // перезапуска проги (та же сессия Dota) сразу менять даже изменённую дистанцию.
-    uintptr_t persistedCamera_ = 0;   // что писать в файл (0 = нет)
-    uintptr_t loadedCamera_ = 0;      // что подхватили из файла этой сессии (0 = нет)
-
     // Файл состояния: чтобы при перезапуске проги (та же сессия Dota) подхватить
     // оффсет даже когда инструкции уже затёрты нашим патчем.
     const std::string STATE_PATH = "/tmp/dota_weather_patch.state";
@@ -77,18 +72,11 @@ class WeatherManager {
         bool valid = false;        // есть валидные данные погоды (база + места патча)
         uintptr_t base = 0;
         uint32_t offset = 0;
-        uintptr_t cameraAddr = 0;
         std::vector<PatchSite> sites;
     };
     State loadState() const;
 
 public:
-    // Адрес камеры, подхваченный из файла этой же сессии (0 = нечего восстанавливать).
-    uintptr_t recoveredCameraAddr() const { return loadedCamera_; }
-
-    // Запомнить адрес камеры и переписать файл состояния (вместе с данными погоды).
-    void persistCamera(uintptr_t addr);
-
     uint32_t offset() const { return resolvedOffset_; }
     bool isLocked() const { return locked_; }
 

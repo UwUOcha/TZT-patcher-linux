@@ -53,6 +53,11 @@ public:
     bool writeBytes(uintptr_t address, const std::vector<uint8_t>& data) const;
     bool readBytes(uintptr_t address, size_t size, std::vector<uint8_t>& buffer) const;
 
+    // Регион целиком одним буфером (чтение идёт чанками — pread на десятки
+    // мегабайт /proc/pid/mem отдаёт короткое чтение). Нужно там, где анализ
+    // смотрит и назад, и вперёд от найденного места, и рвать поток нельзя.
+    bool readRegion(const MemoryRegion& region, std::vector<uint8_t>& buffer) const;
+
     std::vector<MemoryRegion> memoryRegions() const;
 };
 
@@ -70,5 +75,3 @@ std::vector<int> parsePattern(const std::string& pattern);
 std::vector<uintptr_t> findAllPatterns(const ProcessMemory& mem, const MemoryRegion& region,
                                        const std::vector<int>& pattern);
 
-// Первый float в data-регионе, близкий к targetDistance (±10); 0 если нет.
-uintptr_t scanForCameraAddress(const ProcessMemory& mem, const MemoryRegion& region, float targetDistance);

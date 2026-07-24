@@ -253,13 +253,11 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
     std::cout << "[*] Parsing memory maps...\n";
     const auto regions = mem.memoryRegions();
     std::vector<MemoryRegion> clientRegions;
-    std::vector<MemoryRegion> dataRegions;
 
     for (const auto& region : regions) {
         if (region.path.find("libclient.so") != std::string::npos ||
             region.path.find("client.dll") != std::string::npos) {
             if (region.perms.find('x') != std::string::npos) clientRegions.push_back(region);
-            else if (region.perms.find("rw") != std::string::npos) dataRegions.push_back(region);
         }
     }
     std::cout << "[*] Found " << clientRegions.size() << " executable regions.\n";
@@ -268,7 +266,7 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
     RiverManager riverMgr;
     ParticlesManager particlesMgr;
     PlusManager plusMgr;
-    CameraManager camera(mem, dataRegions, [&](uintptr_t addr) { weatherMgr.persistCamera(addr); });
+    CameraManager camera;
 
     // Dota Plus читается один раз во время раннего GC/UI init. Если он выбран при
     // запуске, находим и ставим этот патч ПЕРЕД всеми тяжёлыми сигнатурными
@@ -281,16 +279,7 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
     weatherMgr.scan(mem, clientRegions);
     particlesMgr.scan(mem, clientRegions);
     riverMgr.scan(mem, clientRegions);
-
-    // Восстановление адреса камеры из файла состояния той же сессии Dota.
-    if (const uintptr_t rc = weatherMgr.recoveredCameraAddr()) {
-        float dist = 0.0f;
-        if (mem.read(rc, dist) && dist > 100.0f && dist < 10000.0f) {
-            camera.linkRecovered(rc, dist);
-            std::cout << GREEN << "[+] Camera linked from previous session — distance "
-                      << dist << "." << RESET << "\n";
-        }
-    }
+    camera.scan(mem, regions);
 
     // Применяем выбранные на экране запуска моды сразу после старта игры.
     if (launchedByUs && sel.particles) {
@@ -323,11 +312,16 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
         statusRow(GREEN, "Dota 2   ",
                   GREEN + "running" + RESET + GRAY + "  PID " + std::to_string(dotaPid) + RESET);
 
-        if (camera.isLinked()) {
-            std::ostringstream v; v << GREEN << "linked" << RESET << GRAY << "  " << camera.distance() << RESET;
+        if (!camera.isLinked()) {
+            statusRow(RED, "Camera   ", RED + "not found" + RESET);
+        } else if (camera.isForced(mem)) {
+            std::ostringstream v;
+            v << GREEN << "forced" << RESET << GRAY << "  distance " << camera.distance(mem) << RESET;
             statusRow(GREEN, "Camera   ", v.str());
         } else {
-            statusRow(RED, "Camera   ", GRAY + "not linked" + RESET);
+            std::ostringstream v;
+            v << GRAY << "default  distance " << camera.distance(mem) << RESET;
+            statusRow(YELLOW, "Camera   ", v.str());
         }
 
         if (weatherMgr.isLocked()) {
@@ -377,7 +371,6 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
         std::cout << "\n";
 
         // ── Сервисные действия ──
-        std::cout << "   " << GRAY << "[c] relink camera (if already zoomed)" << RESET << "\n";
         std::cout << "   " << GRAY << "[0] exit" << RESET << "\n";
         std::cout << console::divider();
         std::cout << "\n   " << CYAN << "❯ " << RESET;
@@ -392,41 +385,21 @@ void App::runExternalMode(pid_t dotaPid, const LaunchSelection& sel, bool launch
 
         if (cmd == "1") {
             if (!camera.isLinked()) {
-                std::cout << YELLOW << "Linking camera (default " << CameraManager::DEFAULT_DISTANCE
-                          << ")..." << RESET << "\n";
-                camera.linkAt(CameraManager::DEFAULT_DISTANCE);
-            }
-            if (camera.isLinked()) {
-                float val;
-                if (readFloat("Enter desired distance (e.g. 1400, 1350): ", val)) {
-                    if (camera.setDistance(val))
-                        std::cout << GREEN << "[+] Done! Camera distance = " << val << RESET << "\n";
-                    else
-                        std::cout << RED << "Write failed." << RESET << "\n";
-                }
+                std::cout << RED << "[-] Camera not resolved — cannot change distance." << RESET << "\n";
             } else {
-                std::cout << RED << "[-] Camera not at default " << CameraManager::DEFAULT_DISTANCE
-                          << ".\n    If it's already zoomed out — press [c] and enter the current distance."
-                          << RESET << "\n";
-            }
-            console::pause();
-        } else if (cmd == "c" || cmd == "C") {
-            float scanVal;
-            if (readFloat("\nEnter CURRENT camera distance: ", scanVal)) {
-                std::cout << YELLOW << "Scanning for " << scanVal << "..." << RESET << "\n";
-                if (camera.linkAt(scanVal)) {
-                    std::cout << GREEN << "[+] Camera linked at 0x" << std::hex << camera.address()
-                              << std::dec << RESET << "\n";
-                    float val;
-                    if (readFloat("Enter desired distance (e.g. 1400, 1350): ", val)) {
-                        if (camera.setDistance(val))
-                            std::cout << GREEN << "[+] Done! Camera distance = " << val << RESET << "\n";
+                float val;
+                if (readFloat("Enter desired distance (e.g. 1400; 0 = restore default): ", val)) {
+                    if (val == 0.0f) {
+                        if (camera.restoreDefault(mem))
+                            std::cout << GREEN << "[+] Camera reset to Default (original code restored)."
+                                      << RESET << "\n";
                         else
-                            std::cout << RED << "Write failed." << RESET << "\n";
+                            std::cout << RED << "Restore failed." << RESET << "\n";
+                    } else if (camera.setDistance(mem, val)) {
+                        std::cout << GREEN << "[+] Done! Camera distance = " << val << RESET << "\n";
+                    } else {
+                        std::cout << RED << "Write failed (value out of range?)." << RESET << "\n";
                     }
-                } else {
-                    std::cout << RED << "[-] Not found. Move the camera and enter the exact value."
-                              << RESET << "\n";
                 }
             }
             console::pause();
