@@ -91,7 +91,12 @@ CameraManager::State CameraManager::loadState() const {
 
 float CameraManager::distance(const ProcessMemory& mem) const {
     float v = 0.0f;
-    if (cacheAddr_ != 0) mem.read(cacheAddr_, v);
+    if (cacheAddr_ != 0 && mem.read(cacheAddr_, v) && v >= MIN_SANE && v <= MAX_SANE)
+        return v;
+    // Кеш ещё не прогрет (заполняется при создании первой камеры) — показываем
+    // значение конвара, которое туда и попадёт.
+    float live = 0.0f;
+    if (convarAddr_ != 0 && mem.read(convarAddr_, live)) return live;
     return v;
 }
 
@@ -279,7 +284,12 @@ void CameraManager::scan(const ProcessMemory& mem, const std::vector<MemoryRegio
         std::cout << YELLOW << "[!] Camera: convar data is not readable yet." << RESET << "\n";
         return;
     }
-    if (cached < MIN_SANE || cached > MAX_SANE || live < MIN_SANE || live > MAX_SANE) {
+    // Кеш клиент заполняет ЛЕНИВО — при создании первой камеры. Сразу после старта
+    // игры он ещё нулевой, и это НЕ повод считать резолв неверным: адрес подтверждён
+    // четырьмя независимыми сайтами. Поэтому гейтим по значению конвара, а нулевой
+    // кеш пропускаем — своё значение мы всё равно пишем туда сами.
+    if (live < MIN_SANE || live > MAX_SANE ||
+        (cached != 0.0f && (cached < MIN_SANE || cached > MAX_SANE))) {
         std::cout << YELLOW << "[!] Camera: resolved values look wrong (cache " << cached
                   << ", convar " << live << ") — refusing to use them." << RESET << "\n";
         return;
@@ -291,7 +301,7 @@ void CameraManager::scan(const ProcessMemory& mem, const std::vector<MemoryRegio
     saveState();
     std::cout << CYAN << "[*] Camera: resolved via dota_camera_distance (cache libclient+0x"
               << std::hex << (best - moduleBase) << std::dec << ", " << sites_.size()
-              << " refresh sites) — distance " << cached << "." << RESET << "\n";
+              << " refresh sites) — distance " << distance(mem) << "." << RESET << "\n";
 }
 
 bool CameraManager::setDistance(const ProcessMemory& mem, float value) {
